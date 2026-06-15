@@ -1,0 +1,404 @@
+<<<<<<< HEAD
+API RECON & DISCOVERY
+A practical guide to fingerprinting, endpoint discovery, and parameter fuzzing
+the correct workflow
+Always follow this order. Detect first, brute-force endpoints with dirsearch regardless of tech, then use the tech-specific tool, then find params with arjun.
+step 3   tech-specific tools — pick based on what you detected in step 1
+dirsearch happens before the tech-specific tool. dirsearch finds what paths exist. The tech tool tells you what those paths do. Arjun finds what params those paths accept.
+phase 1 — detect the api technology
+Run these checks in order before picking your tool.
+step 1 — check url patterns
+Look at the urls you collected. The path structure tells you a lot:
+step 2 — check response headers
+command
+curl -I https://target.com/api
+# look for:
+# Content-Type: application/json  → REST or GraphQL
+# X-Powered-By: Express           → Node.js backend
+# Content-Type: text/xml          → SOAP
+step 3 — check options method
+command
+curl -X OPTIONS https://target.com/api
+# response: Allow: GET,POST,PUT,DELETE → REST confirmed
+step 4 — auto-detect with httpx
+command
+cat urls.txt | httpx -tech-detect -json
+phase 2 — dirsearch
+Run dirsearch immediately after detecting the technology. It brute-forces hidden directories and files on a web server. This step runs regardless of which tech you detected — the output feeds into both the tech-specific tool and arjun.
+how it works
+flags
+status codes — what to look for
+403 is often more interesting than 200. It confirms the resource exists but is protected. Flag these for bypass testing.
+commands
+show only 200 responses
+python3 dirsearch.py -u {TARGET_URL} -e php,html,txt,bak -i 200
+show only 403 responses (hidden but real)
+python3 dirsearch.py -u {TARGET_URL} -e php,html,txt,bak -i 403
+show 200 and 403 together
+python3 dirsearch.py -u {TARGET_URL} -e php,html,txt,bak -i 200,403
+phase 3 — tools by technology
+Take the endpoints from dirsearch and run the tool that matches the technology you detected in phase 1.
+graphql
+step 1 — confirm graphql
+command
+curl -X POST https://target.com/graphql \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{__typename}"}'
+# response: {"data":{"__typename":"Query"}} → confirmed
+step 2 — run introspection with inql
+install
+pip install inql
+run
+inql -t https://target.com/graphql
+step 3 — manual introspection query
+curl -X POST https://target.com/graphql \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ __schema { types { name } } }"}'
+rest api
+step 1 — collect all api urls
+gau target.com | grep -E "api|v1|v2" > api_urls.txt
+waybackurls target.com | grep "api" >> api_urls.txt
+step 2 — probe each endpoint
+cat api_urls.txt | httpx -mc 200,401,403 -json > live_apis.json
+step 3 — test http methods per endpoint
+for method in GET POST PUT DELETE PATCH; do
+  curl -s -o /dev/null -w "%{http_code} $method\n" \
+    -X $method https://target.com/api/users
+done
+swagger / openapi
+step 1 — find the swagger file
+for path in /swagger.json /openapi.json /api-docs /swagger-ui /v2/api-docs; do
+  curl -s -o /dev/null -w "%{http_code} $path\n" \
+    https://target.com$path
+done
+# 200 on any path = swagger spec found
+step 2 — extract all endpoints from spec
+curl -s https://target.com/swagger.json \
+  | python3 -c "
+import json,sys
+spec = json.load(sys.stdin)
+for path in spec.get('paths', {}):
+  print(path)
+"
+soap
+step 1 — fetch the wsdl
+curl -s "https://target.com/service?wsdl" -o service.wsdl
+step 2 — extract operations
+grep -i "operation name" service.wsdl
+grpc
+step 1 — detect via headers
+curl -I --http2 https://target.com
+# look for:
+# content-type: application/grpc
+# grpc-status header
+step 2 — list services with grpcurl
+grpcurl -plaintext target.com:443 list
+step 3 — describe a service
+grpcurl -plaintext target.com:443 describe ServiceName
+phase 4 — arjun
+Takes the endpoints found by dirsearch and discovers hidden HTTP parameters. Run this on every interesting endpoint — arjun compares responses to detect which params the endpoint actually uses.
+how it works
+3 modes — pick based on endpoint type
+GET — parameters in url query string
+python3 arjun.py -u {INPUT_FROM_DIRSEARCH} -m GET
+POST — parameters in form body
+python3 arjun.py -u {INPUT_FROM_DIRSEARCH} -m POST
+JSON POST — parameters inside json body
+python3 arjun.py -u {INPUT_FROM_DIRSEARCH} -m JSON
+add auth headers and cookies
+with bearer token
+python3 arjun.py -u {URL} -H "Authorization: Bearer TOKEN"
+with session cookie
+python3 arjun.py -u {URL} -c "PHPSESSID=abc123"
+run on multiple urls from a file
+arjun -i urls.txt
+step 1 | detect technology
+httpx, url patterns, headers, OPTIONS method
+↓ | ↓
+step 2 | dirsearch
+brute-force all hidden endpoints — runs regardless of which tech was detected
+↓ | ↓
+GraphQL
+inql, introspection | GraphQL
+inql, introspection | REST / Swagger
+httpx, method scan | SOAP / gRPC
+wsdl, grpcurl | 
+↓ | ↓ | ↓ | ↓ | ↓
+step 4 | arjun
+discover hidden GET / POST / JSON params on every endpoint found by dirsearch | arjun
+discover hidden GET / POST / JSON params on every endpoint found by dirsearch | arjun
+discover hidden GET / POST / JSON params on every endpoint found by dirsearch | arjun
+discover hidden GET / POST / JSON params on every endpoint found by dirsearch
+technology | url indicators
+REST | /api/   /v1/   /v2/   /users   /products
+GraphQL | /graphql   /graphiql   /playground
+SOAP | /wsdl   /soap   ?wsdl
+Swagger/OpenAPI | /swagger.json   /openapi.json   /api-docs   /swagger-ui
+gRPC | HTTP/2 headers + application/grpc content-type
+INPUT
+urls.txt — list of target urls | OUTPUT
+JSON with tech stack, status codes, headers per url
+Input URL | Load Wordlist | Build URLs | Send Requests | Analyze Responses | Filter + Output
+flag | what it does
+-u | target domain url
+-e | file extensions to check (php, html, txt, bak...)
+-i | include only these status codes in output
+code | meaning | why it matters
+200 OK | exists and accessible | potentially sensitive page or file
+301/302 | redirect | hidden admin panel or login page
+401 Unauthorized | auth required | resource exists — just locked
+403 Forbidden | access denied | very important — hidden resource is confirmed
+405 Method Not Allowed | wrong http method | endpoint exists — try other methods
+500 Server Error | server crashed | may expose vulnerability details
+204 No Content | exists but empty | can indicate hidden api endpoints
+INPUT
+target url, extension list, status filter | OUTPUT
+list of hidden endpoints → feed into tech tool AND arjun
+INPUT
+graphql endpoint url | OUTPUT
+{"data":{"__typename":"Query"}} = confirmed
+INPUT
+graphql endpoint | OUTPUT
+full schema dump — all queries, mutations, types
+INPUT
+introspection query | OUTPUT
+full list of all types, fields, and endpoints
+INPUT
+target domain | OUTPUT
+api_urls.txt — filtered api endpoint list
+INPUT
+api_urls.txt | OUTPUT
+live_apis.json — endpoints with status + headers
+INPUT
+single rest endpoint | OUTPUT
+status per method — reveals hidden methods
+INPUT
+target domain | OUTPUT
+200 response on a path = swagger spec confirmed
+INPUT
+swagger.json url | OUTPUT
+printed list of all api paths
+INPUT
+soap service url with ?wsdl | OUTPUT
+service.wsdl — xml definition of all operations
+INPUT
+service.wsdl file | OUTPUT
+list of all callable soap operations
+INPUT
+host:port | OUTPUT
+all registered grpc services
+INPUT
+service name from step 2 | OUTPUT
+all methods and proto fields for that service
+Endpoint from Dirsearch | Load Param Wordlist | Send Requests | Compare Responses | Detect Changes | Valid Params
+INPUT
+endpoint url from dirsearch | OUTPUT
+hidden GET params like ?id=&user=
+INPUT
+endpoint url from dirsearch | OUTPUT
+hidden form params like username=&token=
+INPUT
+endpoint url from dirsearch | OUTPUT
+=======
+API RECON & DISCOVERY
+A practical guide to fingerprinting, endpoint discovery, and parameter fuzzing
+the correct workflow
+Always follow this order. Detect first, brute-force endpoints with dirsearch regardless of tech, then use the tech-specific tool, then find params with arjun.
+step 3   tech-specific tools — pick based on what you detected in step 1
+dirsearch happens before the tech-specific tool. dirsearch finds what paths exist. The tech tool tells you what those paths do. Arjun finds what params those paths accept.
+phase 1 — detect the api technology
+Run these checks in order before picking your tool.
+step 1 — check url patterns
+Look at the urls you collected. The path structure tells you a lot:
+step 2 — check response headers
+command
+curl -I https://target.com/api
+# look for:
+# Content-Type: application/json  → REST or GraphQL
+# X-Powered-By: Express           → Node.js backend
+# Content-Type: text/xml          → SOAP
+step 3 — check options method
+command
+curl -X OPTIONS https://target.com/api
+# response: Allow: GET,POST,PUT,DELETE → REST confirmed
+step 4 — auto-detect with httpx
+command
+cat urls.txt | httpx -tech-detect -json
+phase 2 — dirsearch
+Run dirsearch immediately after detecting the technology. It brute-forces hidden directories and files on a web server. This step runs regardless of which tech you detected — the output feeds into both the tech-specific tool and arjun.
+how it works
+flags
+status codes — what to look for
+403 is often more interesting than 200. It confirms the resource exists but is protected. Flag these for bypass testing.
+commands
+show only 200 responses
+python3 dirsearch.py -u {TARGET_URL} -e php,html,txt,bak -i 200
+show only 403 responses (hidden but real)
+python3 dirsearch.py -u {TARGET_URL} -e php,html,txt,bak -i 403
+show 200 and 403 together
+python3 dirsearch.py -u {TARGET_URL} -e php,html,txt,bak -i 200,403
+phase 3 — tools by technology
+Take the endpoints from dirsearch and run the tool that matches the technology you detected in phase 1.
+graphql
+step 1 — confirm graphql
+command
+curl -X POST https://target.com/graphql \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{__typename}"}'
+# response: {"data":{"__typename":"Query"}} → confirmed
+step 2 — run introspection with inql
+install
+pip install inql
+run
+inql -t https://target.com/graphql
+step 3 — manual introspection query
+curl -X POST https://target.com/graphql \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ __schema { types { name } } }"}'
+rest api
+step 1 — collect all api urls
+gau target.com | grep -E "api|v1|v2" > api_urls.txt
+waybackurls target.com | grep "api" >> api_urls.txt
+step 2 — probe each endpoint
+cat api_urls.txt | httpx -mc 200,401,403 -json > live_apis.json
+step 3 — test http methods per endpoint
+for method in GET POST PUT DELETE PATCH; do
+  curl -s -o /dev/null -w "%{http_code} $method\n" \
+    -X $method https://target.com/api/users
+done
+swagger / openapi
+step 1 — find the swagger file
+for path in /swagger.json /openapi.json /api-docs /swagger-ui /v2/api-docs; do
+  curl -s -o /dev/null -w "%{http_code} $path\n" \
+    https://target.com$path
+done
+# 200 on any path = swagger spec found
+step 2 — extract all endpoints from spec
+curl -s https://target.com/swagger.json \
+  | python3 -c "
+import json,sys
+spec = json.load(sys.stdin)
+for path in spec.get('paths', {}):
+  print(path)
+"
+soap
+step 1 — fetch the wsdl
+curl -s "https://target.com/service?wsdl" -o service.wsdl
+step 2 — extract operations
+grep -i "operation name" service.wsdl
+grpc
+step 1 — detect via headers
+curl -I --http2 https://target.com
+# look for:
+# content-type: application/grpc
+# grpc-status header
+step 2 — list services with grpcurl
+grpcurl -plaintext target.com:443 list
+step 3 — describe a service
+grpcurl -plaintext target.com:443 describe ServiceName
+phase 4 — arjun
+Takes the endpoints found by dirsearch and discovers hidden HTTP parameters. Run this on every interesting endpoint — arjun compares responses to detect which params the endpoint actually uses.
+how it works
+3 modes — pick based on endpoint type
+GET — parameters in url query string
+python3 arjun.py -u {INPUT_FROM_DIRSEARCH} -m GET
+POST — parameters in form body
+python3 arjun.py -u {INPUT_FROM_DIRSEARCH} -m POST
+JSON POST — parameters inside json body
+python3 arjun.py -u {INPUT_FROM_DIRSEARCH} -m JSON
+add auth headers and cookies
+with bearer token
+python3 arjun.py -u {URL} -H "Authorization: Bearer TOKEN"
+with session cookie
+python3 arjun.py -u {URL} -c "PHPSESSID=abc123"
+run on multiple urls from a file
+arjun -i urls.txt
+step 1 | detect technology
+httpx, url patterns, headers, OPTIONS method
+↓ | ↓
+step 2 | dirsearch
+brute-force all hidden endpoints — runs regardless of which tech was detected
+↓ | ↓
+GraphQL
+inql, introspection | GraphQL
+inql, introspection | REST / Swagger
+httpx, method scan | SOAP / gRPC
+wsdl, grpcurl | 
+↓ | ↓ | ↓ | ↓ | ↓
+step 4 | arjun
+discover hidden GET / POST / JSON params on every endpoint found by dirsearch | arjun
+discover hidden GET / POST / JSON params on every endpoint found by dirsearch | arjun
+discover hidden GET / POST / JSON params on every endpoint found by dirsearch | arjun
+discover hidden GET / POST / JSON params on every endpoint found by dirsearch
+technology | url indicators
+REST | /api/   /v1/   /v2/   /users   /products
+GraphQL | /graphql   /graphiql   /playground
+SOAP | /wsdl   /soap   ?wsdl
+Swagger/OpenAPI | /swagger.json   /openapi.json   /api-docs   /swagger-ui
+gRPC | HTTP/2 headers + application/grpc content-type
+INPUT
+urls.txt — list of target urls | OUTPUT
+JSON with tech stack, status codes, headers per url
+Input URL | Load Wordlist | Build URLs | Send Requests | Analyze Responses | Filter + Output
+flag | what it does
+-u | target domain url
+-e | file extensions to check (php, html, txt, bak...)
+-i | include only these status codes in output
+code | meaning | why it matters
+200 OK | exists and accessible | potentially sensitive page or file
+301/302 | redirect | hidden admin panel or login page
+401 Unauthorized | auth required | resource exists — just locked
+403 Forbidden | access denied | very important — hidden resource is confirmed
+405 Method Not Allowed | wrong http method | endpoint exists — try other methods
+500 Server Error | server crashed | may expose vulnerability details
+204 No Content | exists but empty | can indicate hidden api endpoints
+INPUT
+target url, extension list, status filter | OUTPUT
+list of hidden endpoints → feed into tech tool AND arjun
+INPUT
+graphql endpoint url | OUTPUT
+{"data":{"__typename":"Query"}} = confirmed
+INPUT
+graphql endpoint | OUTPUT
+full schema dump — all queries, mutations, types
+INPUT
+introspection query | OUTPUT
+full list of all types, fields, and endpoints
+INPUT
+target domain | OUTPUT
+api_urls.txt — filtered api endpoint list
+INPUT
+api_urls.txt | OUTPUT
+live_apis.json — endpoints with status + headers
+INPUT
+single rest endpoint | OUTPUT
+status per method — reveals hidden methods
+INPUT
+target domain | OUTPUT
+200 response on a path = swagger spec confirmed
+INPUT
+swagger.json url | OUTPUT
+printed list of all api paths
+INPUT
+soap service url with ?wsdl | OUTPUT
+service.wsdl — xml definition of all operations
+INPUT
+service.wsdl file | OUTPUT
+list of all callable soap operations
+INPUT
+host:port | OUTPUT
+all registered grpc services
+INPUT
+service name from step 2 | OUTPUT
+all methods and proto fields for that service
+Endpoint from Dirsearch | Load Param Wordlist | Send Requests | Compare Responses | Detect Changes | Valid Params
+INPUT
+endpoint url from dirsearch | OUTPUT
+hidden GET params like ?id=&user=
+INPUT
+endpoint url from dirsearch | OUTPUT
+hidden form params like username=&token=
+INPUT
+endpoint url from dirsearch | OUTPUT
+>>>>>>> latest
+hidden json keys like {"id": ?, "role": ?}
