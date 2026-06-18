@@ -492,31 +492,14 @@ def run_httpx(domains):
 # ── Wappalyzer Technology Detection ──────────────────────────────────────────
 
 def run_wappalyzer(targets):
-    """Use python-Wappalyzer for tech stack detection."""
-    if not WAPPALYZER_AVAILABLE or not targets:
-        return []
-
+    """Use the Node.js Wappalyzer implementation from reconnaissance app."""
     try:
-        wappalyzer = Wappalyzer.latest()
-    except Exception:
+        from reconnaissance.services.wappalyzer_scanner import run_wappalyzer as recon_run_wappalyzer
+        result = recon_run_wappalyzer(targets[:100])
+        return result.get("parsed_output", {}).get("hosts", [])
+    except Exception as e:
+        logger.error(f"Failed to run Node Wappalyzer: {e}")
         return []
-
-    results = []
-    for t in targets[:100]:
-        url = t if (t.startswith("http://") or t.startswith("https://")) else f"https://{t}"
-        try:
-            webpage = WebPage.new_from_url(url, timeout=15)
-            techs = wappalyzer.analyze(webpage)
-            if techs:
-                host = urlparse(url).hostname or t
-                results.append({
-                    "domain": host,
-                    "url": url,
-                    "technologies": sorted(techs),
-                })
-        except Exception:
-            pass
-    return results
 
 
 # ── Whatweb-like HTTP Header & Meta Analysis ─────────────────────────────────
@@ -607,13 +590,6 @@ def run_header_tech_analysis(targets, httpx_results):
         if host not in tech_map:
             tech_map[host] = set()
         tech_map[host].update(found)
-
-    # Also enrich httpx tech field
-    for data in httpx_results:
-        url = data.get("url", "")
-        host = urlparse(url).hostname or ""
-        if host in tech_map:
-            data["tech"] = list(set(data.get("tech", []) + list(tech_map[host])))
 
     return tech_map
 
@@ -764,6 +740,9 @@ def run_python_vuln_scanner(target, httpx_results, port_results=None):
                 "cve": "",
                 "cwe": "CWE-693",
                 "finding": f"Missing security headers on {host}: {header_names}",
+                "description": f"The web server is missing the following essential security headers: {header_names}. These headers instruct the browser on how to handle the site's content securely. Without them, the application is more susceptible to Cross-Site Scripting (XSS), Clickjacking, MIME-sniffing, and MITM attacks.",
+                "remediation": "Configure your web server or application framework to emit the missing security headers on all HTTP responses. For example, add 'Content-Security-Policy', 'X-Frame-Options: SAMEORIGIN', 'X-Content-Type-Options: nosniff', and 'Strict-Transport-Security'.",
+                "reference": "https://owasp.org/www-project-secure-headers/",
                 "template_id": "security-header/multiple",
                 "source_tool": "PythonScanner",
             })
@@ -781,6 +760,9 @@ def run_python_vuln_scanner(target, httpx_results, port_results=None):
                 "cve": "",
                 "cwe": "CWE-200",
                 "finding": f"Server version disclosure on {host}: '{server}' header reveals version information",
+                "description": f"The HTTP response includes a 'Server: {server}' header that explicitly reveals the underlying software and version number. This allows attackers to quickly identify vulnerable software versions without actively probing the server.",
+                "remediation": "Modify the web server configuration to suppress or obfuscate the 'Server' header.",
+                "reference": "https://cwe.mitre.org/data/definitions/200.html",
                 "template_id": "info-disclosure/server-header",
                 "source_tool": "PythonScanner",
             })
@@ -798,6 +780,9 @@ def run_python_vuln_scanner(target, httpx_results, port_results=None):
                 "cve": "",
                 "cwe": "CWE-200",
                 "finding": f"Technology fingerprint disclosure on {host}: X-Powered-By: {xpb}",
+                "description": f"The HTTP response includes an 'X-Powered-By: {xpb}' header which discloses the technology stack used by the backend application.",
+                "remediation": "Remove the 'X-Powered-By' header in your application framework or reverse proxy configuration.",
+                "reference": "https://owasp.org/www-project-secure-headers/",
                 "template_id": "info-disclosure/x-powered-by",
                 "source_tool": "PythonScanner",
             })
@@ -1023,8 +1008,7 @@ def _build_nuclei_base_args(exe, severity=None, http_timeout=5):
         "-c", "20",            # concurrent templates
         "-duc",                 # disable update check
         "-ni",                  # disable interactsh (no external callback needed)
-        "-nc",                  # no coloured output
-        "-severity", severity or "medium,high,critical",
+        "-severity", severity or "info,low,medium,high,critical",
     ]
 
 
@@ -1075,9 +1059,22 @@ def _run_nuclei_batch(exe, targets, tags=None, severity=None, http_timeout=5):
             continue
         info = data.get("info", {})
         matched = data.get("matched-at") or data.get("url") or ""
+        
+        description = info.get("description") or ""
+        extracted = data.get("extracted-results", [])
+        if extracted:
+            extracted_str = ", ".join(extracted)
+            if description:
+                description = f"{description}\n\nExtracted Secrets: {extracted_str}"
+            else:
+                description = f"Extracted Secrets: {extracted_str}"
+                
         vulns.append({
             "template_id": data.get("template-id"),
             "name": info.get("name"),
+            "description": description,
+            "remediation": info.get("remediation"),
+            "reference": ", ".join(info.get("reference", [])) if isinstance(info.get("reference"), list) else info.get("reference"),
             "severity": info.get("severity"),
             "type": data.get("type"),
             "protocol": data.get("protocol"),
@@ -1108,10 +1105,11 @@ def run_nuclei(targets, tech_tags=None, http_timeout=5):
         return []
     targets = targets[:50]  # allow more targets since sub-runs are lighter
 
-    tag_groups = list(NUCLEI_TAG_GROUPS)
     if tech_tags:
-        # Add tech_tags as an additional parallel group to preserve core categories
-        tag_groups.append(tech_tags)
+        # Fast vulnerability scanning: use ONLY the asset discovery tags + fast misconfigs
+        tag_groups = [tech_tags, ["misconfiguration", "misconfig"], ["exposure", "default-login"]]
+    else:
+        tag_groups = list(NUCLEI_TAG_GROUPS)
 
     # Launch parallel sub-runs
     all_vulns = []
@@ -1686,13 +1684,22 @@ def run_full_scan(scan):
 
         mark_phase(scan, "directories_done", 55)
 
-        # ── Phase 5: Technology Detection (Wappalyzer + header analysis) ──────
+        # ── Phase 5: Technology Detection (Wappalyzer + header analysis + WhatCMS) ──────
+        from .scanner.whatcms_scanner import run_whatcms
+        whatcms_results = run_whatcms(subdomains[:200])
+        whatcms_tech_map = {}
+        for wr in whatcms_results:
+            dom = wr.get("domain", "")
+            if dom:
+                whatcms_tech_map[dom] = wr.get("technologies", [])
+
+        # Fast Node.js Wappalyzer with headless browser disabled
         wappalyzer_results = run_wappalyzer(subdomains[:200])
         wapp_tech_map = {}
         for wr in wappalyzer_results:
             dom = wr.get("domain", "")
             if dom:
-                wapp_tech_map[dom] = wr.get("technologies", [])
+                wapp_tech_map[dom] = [f"{t} [Wappalyzer]" for t in wr.get("technologies", [])]
         header_techs = run_header_tech_analysis(subdomains[:200], httpx_results)
 
         # Merge all techs per host
@@ -1702,12 +1709,20 @@ def run_full_scan(scan):
             host = urlparse(url).hostname or ""
             if not host:
                 continue
-            techs = set(data.get("tech", []) or [])
+            tech_list = []
+            if host in whatcms_tech_map:
+                tech_list.extend(whatcms_tech_map[host])
             if host in wapp_tech_map:
-                techs.update(wapp_tech_map[host])
+                tech_list.extend(wapp_tech_map[host])
             if host in header_techs:
-                techs.update(header_techs[host])
-            combined_tech_map[host] = sorted(techs) if techs else []
+                tech_list.extend([f"{t} [Header Analysis]" for t in header_techs[host]])
+            for t in data.get("tech", []):
+                if t:
+                    if ':' in t:
+                        t = t.replace(':', '/', 1)
+                    tech_list.append(f"{t} [HTTPX]")
+            
+            combined_tech_map[host] = sorted(list(set(tech_list))) if tech_list else []
 
         # Save endpoints
         endpoint_covered = set()
@@ -1773,18 +1788,7 @@ def run_full_scan(scan):
                     technologies=["Nginx", "Cloudflare", "React"] if "www" in ep["url"] else ["Node.js", "Docker"],
                 )
 
-        # Immediate Technologies Fallback / Enrichment
-        if TechnologyResult.objects.filter(scan=scan).count() < 2:
-            tech_data = [
-                {"dom": f"www.{target}", "techs": ["React", "Next.js", "Nginx", "Cloudflare", "Amazon Web Services"]},
-                {"dom": f"api.{target}", "techs": ["Node.js", "Express", "PostgreSQL", "Docker"]},
-                {"dom": f"admin.{target}", "techs": ["Angular", "Django", "Apache", "Bootstrap"]},
-            ]
-            for td in tech_data:
-                TechnologyResult.objects.get_or_create(
-                    scan=scan, domain=td["dom"],
-                    defaults={"technologies": td["techs"], "org_id": org_id}
-                )
+        mark_phase(scan, "technologies_done", 65)
 
         # ── Phase 6: Email security ───────────────────────────────────────────
         try:
@@ -1792,21 +1796,8 @@ def run_full_scan(scan):
         except Exception:
             email_results = {}
 
-        # Immediate Email Security Fallback / Enrichment
+        # Email Security Mapping
         email_data = {k: v for k, v in email_results.items() if k != "domain"}
-        if not email_data or not email_data.get("root_txt") or not email_data.get("mx"):
-            email_data = {
-                "root_txt": [f"v=spf1 include:_spf.google.com ~all", f"google-site-verification=abc123_verification_code"],
-                "spf": [f"v=spf1 include:_spf.google.com ~all"],
-                "dmarc": [f"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc-reports@{target}"],
-                "mx": [f"10 mail.{target}", f"20 backup-mail.{target}"],
-                "dkim_selector1": [f"v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAv6k5d..."],
-                "dkim_default": [f"v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA34k9d..."],
-                "smtp_hosts": [f"mail.{target}"],
-                "smtp_port_scan": {"raw": "Port 25/tcp is OPEN\nPort 465/tcp is CLOSED\nPort 587/tcp is OPEN", "target": f"mail.{target}"},
-                "smtp_open_relay": {"raw": "SMTP Open Relay: NOT VULNERABLE", "target": f"mail.{target}"},
-                "smtp_starttls": {"raw": "STARTTLS supported by server.", "target": f"mail.{target}"},
-            }
 
         EmailSecurityResult.objects.create(
             scan=scan, domain=target, org_id=org_id, **email_data,
@@ -1842,39 +1833,28 @@ def run_full_scan(scan):
                 # Reload scan instance
                 bg_scan = AttackSurfaceScan.objects.get(id=scan.id)
                 
-                try:
-                    # Phase 7a: Run Python-based vulnerability scanner
-                    python_vulns = run_python_vuln_scanner(target, httpx_results, port_results=nmap_results)
-                except Exception as e:
-                    logger.exception("python scanner failed: %s", e)
-                    python_vulns = []
+                # Phase 7a skipped to prioritize speed
+                python_vulns = []
                     
-                # Gradual Timeout Logic
-                current_timeout = 5
-                max_timeout = 25
+                # Run Nuclei Vulnerability Scan (Optimized for speed)
+                bg_scan.vuln_scan_phase = "running_nuclei"
+                bg_scan.save(update_fields=["vuln_scan_phase"])
                 nuclei_results = []
-                
-                while current_timeout <= max_timeout:
-                    bg_scan.vuln_scan_phase = f"running_{current_timeout}s"
-                    bg_scan.save(update_fields=["vuln_scan_phase"])
-                    logger.info("Phase 5b dynamic: Running Nuclei with timeout=%ds", current_timeout)
+                for attempt in range(1, 4):
                     try:
-                        nuclei_results = run_nuclei(live_urls[:50], tech_tags=nuclei_tags, http_timeout=current_timeout)
+                        logger.info("Starting nuclei phase (attempt %d)...", attempt)
+                        nuclei_results = run_nuclei(live_urls[:50], tech_tags=nuclei_tags, http_timeout=15)
+                        if nuclei_results is not None:
+                            break  # Success
                     except Exception as e:
-                        logger.exception("nuclei phase failed: %s", e)
-                        
-                    if nuclei_results:
-                        logger.info("Phase 5b dynamic: Nuclei found %d results at timeout=%ds", len(nuclei_results), current_timeout)
-                        break
-                    
-                    if current_timeout >= max_timeout:
-                        logger.info("Phase 5b dynamic: Nuclei hit max timeout %ds with 0 results.", max_timeout)
-                        break
-                        
-                    logger.info("Phase 5b dynamic: 0 results at timeout=%ds. Increasing timeout and retrying...", current_timeout)
-                    current_timeout += 10
+                        logger.exception("nuclei phase failed on attempt %d: %s", attempt, e)
+                        if attempt == 3:
+                            logger.error("Nuclei failed after 3 attempts.")
+                        else:
+                            time.sleep(2)
 
                 # Run Wapiti scanner
+                bg_scan.refresh_from_db()
                 bg_scan.vuln_scan_phase = "running_wapiti"
                 bg_scan.save(update_fields=["vuln_scan_phase"])
                 wapiti_results = []
@@ -1884,11 +1864,7 @@ def run_full_scan(scan):
                     logger.exception("wapiti phase failed: %s", e)
 
                 # Combine all vulnerability findings
-                if not nuclei_results:
-                    logger.info("Phase 5b dynamic: Nuclei found nothing. Discarding PythonScanner results.")
-                    all_vulns = list(wapiti_results)
-                else:
-                    all_vulns = list(python_vulns) + list(nuclei_results) + list(wapiti_results)
+                all_vulns = list(python_vulns) + list(nuclei_results) + list(wapiti_results)
 
                 # Delete any existing interim findings to prepare for combined save
                 deleted_count, _ = VulnerabilityResult.objects.filter(scan_id=bg_scan.id).delete()
@@ -1906,6 +1882,9 @@ def run_full_scan(scan):
                     cve = nv.get("cve", "")
                     cwe = nv.get("cwe", "")
                     finding = nv.get("finding") or nv.get("name", "")
+                    description = nv.get("description", "")
+                    remediation = nv.get("remediation", "")
+                    reference = nv.get("reference", "")
                     template_id = nv.get("template_id", "")
                     source_tool = nv.get("source_tool", "Nuclei")
                     vuln_id = nv.get("vulnerability_id") or (f"CVE-{cve}" if cve else f"NUC-{template_id or 'unknown'}")
@@ -1919,6 +1898,9 @@ def run_full_scan(scan):
                             "cve": cve or "-",
                             "cwe": cwe or "-",
                             "finding": finding or "-",
+                            "description": description or "-",
+                            "remediation": remediation or "-",
+                            "reference": reference or "-",
                             "template_id": template_id or "",
                             "source_tool": source_tool,
                             "org_id": org_id,
@@ -1934,6 +1916,7 @@ def run_full_scan(scan):
                         vulnerabilities_count=count
                     )
 
+                bg_scan.refresh_from_db()
                 bg_scan.vuln_scan_phase = "complete"
                 bg_scan.vulnerabilities_done = True
                 bg_scan.save(update_fields=["vuln_scan_phase", "vulnerabilities_done"])

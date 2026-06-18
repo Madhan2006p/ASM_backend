@@ -55,13 +55,80 @@ class BrandMonitorTargetViewSet(viewsets.ModelViewSet):
             # Targets to create
             to_create = all_domains - existing_domains
             for domain in to_create:
-                BrandMonitorTarget.objects.create(
+                target = BrandMonitorTarget.objects.create(
                     domain=domain,
                     brand_name=domain.split('.')[0].capitalize(),
                     is_active=True,
                     status='active',
                     org_id=org_id
                 )
+                
+                # Auto-trigger Brand Monitoring Scans for newly synced domains
+                import threading
+                
+                try:
+                    check_domain_virustotal.delay(target_id=target.id)
+                except Exception as e:
+                    logger.error(f"Auto-VT scan failed for {domain}: {e}")
+                
+                try:
+                    s_report = SuspiciousDomainReport.objects.create(
+                        domain=domain,
+                        status='pending',
+                        org_id=org_id
+                    )
+                    analyze_suspicious_domain_task.delay(s_report.id)
+                except Exception as e:
+                    logger.error(f"Auto-Suspicious scan failed for {domain}: {e}")
+                    
+                try:
+                    def _run_phishing(t_id):
+                        try:
+                            analyze_phishing_domain_task.run(t_id)
+                        except Exception as err:
+                            import logging
+                            logging.getLogger(__name__).error(f"Background phishing scan failed for target {t_id}: {err}")
+                    threading.Thread(target=_run_phishing, args=(target.id,), daemon=True).start()
+                except Exception as e:
+                    logger.error(f"Auto-Phishing scan start failed for {domain}: {e}")
+
+                # 4. Trigger Impersonation Scan
+                try:
+                    org_name_val = domain.split('.')[0].capitalize()
+                    try:
+                        from authentication.models import Organization
+                        org = Organization.objects.filter(org_id=org_id).first()
+                        if org and org.name:
+                            org_name_val = org.name.strip()
+                    except Exception:
+                        pass
+                        
+                    username_val = "".join(e for e in org_name_val if e.isalnum()).lower()
+                    if not username_val:
+                        username_val = domain.split('.')[0].lower()
+
+                    i_scan = ImpersonatingScan.objects.create(
+                        username=username_val,
+                        brand_domain=domain,
+                        org_name=org_name_val,
+                        org_id=org_id,
+                        status="pending"
+                    )
+                    
+                    def _run_impersonation(s_id):
+                        try:
+                            from .impersonation_tasks import run_impersonation_scan
+                            run_impersonation_scan(s_id)
+                        except Exception as err:
+                            import logging
+                            logging.getLogger(__name__).error(f"Background impersonation scan failed for scan {s_id}: {err}")
+                            try:
+                                ImpersonatingScan.objects.filter(id=s_id).update(status="failed")
+                            except Exception:
+                                pass
+                    threading.Thread(target=_run_impersonation, args=(i_scan.id,), daemon=True).start()
+                except Exception as e:
+                    logger.error(f"Auto-Impersonation scan start failed for {domain}: {e}")
                 
             # Targets to delete (no longer monitored or scanned)
             to_delete = existing_domains - all_domains
@@ -164,12 +231,24 @@ class BrandMonitorTargetViewSet(viewsets.ModelViewSet):
         latest_reports = VirusTotalReport.objects.filter(id__in=latest_ids) \
             .select_related('target').order_by('-checked_at')[:10]
 
+        # Calculate additional metrics for frontend
+        total_suspicious_domains = SuspiciousDomainReport.objects.filter(org_id=org_id).count()
+        total_phishing_domains = PhishingDomainReport.objects.filter(org_id=org_id).count()
+        total_impersonations = ImpersonatingAccountResult.objects.filter(org_id=org_id).count()
+        
+        # Define what constitutes an active alert (could be expanded later)
+        active_alerts = (total_malicious or 0) + (total_suspicious or 0)
+
         serializer = BrandMonitorDashboardSerializer(data={
             'total_targets': targets.count(),
             'total_reports': reports.count(),
             'active_targets': targets.filter(is_active=True).count(),
             'total_malicious': total_malicious,
             'total_suspicious': total_suspicious,
+            'total_suspicious_domains': total_suspicious_domains,
+            'total_phishing_domains': total_phishing_domains,
+            'total_impersonations': total_impersonations,
+            'active_alerts': active_alerts,
             'org_name': org_name,
             'latest_reports': VirusTotalReportSerializer(latest_reports, many=True).data,
             'targets_by_status': status_counts,

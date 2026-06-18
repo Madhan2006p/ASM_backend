@@ -9,7 +9,12 @@ from .command_utils import (
 )
 
 
+import json
+import os
+
 HTTPX_CANDIDATES = (
+    os.path.expanduser("~/go/bin/httpx"),
+    "/home/madhan/go/bin/httpx",
     r"C:\Users\samyu\go\bin\httpx.exe",
     r"C:\tools\httpx\httpx.exe",
 )
@@ -55,6 +60,8 @@ def run_httpx(subdomains):
                 "-l",
                 str(input_file),
                 "-silent",
+                "-tech-detect",
+                "-json",
             ],
             timeout=240,
         )
@@ -73,12 +80,30 @@ def run_httpx(subdomains):
 
 
 def parse_httpx(output):
-    live_hosts = dedupe_preserve_order(
-        line.strip()
-        for line in output.splitlines()
-    )
+    live_hosts = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            url = data.get("url", "")
+            techs = data.get("tech", [])
+            if url:
+                live_hosts.append({
+                    "url": url,
+                    "technologies": techs,
+                })
+        except json.JSONDecodeError:
+            pass
 
-    return [
-        {"url": url}
-        for url in live_hosts
-    ]
+    # Deduplicate preserving order
+    seen = set()
+    deduped_hosts = []
+    for host in live_hosts:
+        url = host["url"]
+        if url not in seen:
+            seen.add(url)
+            deduped_hosts.append(host)
+
+    return deduped_hosts

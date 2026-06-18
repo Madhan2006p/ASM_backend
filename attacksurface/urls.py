@@ -1,4 +1,11 @@
-from django.urls import path
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+
+from .internal_views import InternalNetworkScanViewSet, InternalAssetViewSet
+
+router = DefaultRouter()
+router.register(r'internal-scans', InternalNetworkScanViewSet, basename='internal-scan')
+router.register(r'internal-assets', InternalAssetViewSet, basename='internal-asset')
 
 from .views import (
     ClearDatabaseView,
@@ -42,4 +49,5 @@ urlpatterns = [
     path("vulnerabilities/send-to-faraday/", SendVulnerabilitiesToFaradayView.as_view(), name="attacksurface-send-to-faraday"),
     path("faraday-findings/", FaradayFindingsView.as_view(), name="attacksurface-faraday-findings"),
     path("faraday-summary/", FaradaySummaryView.as_view(), name="attacksurface-faraday-summary"),
+    path("", include(router.urls)),
 ]

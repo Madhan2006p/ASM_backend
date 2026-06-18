@@ -61,6 +61,13 @@ class BrandMonitorDashboardSerializer(serializers.Serializer):
     active_targets = serializers.IntegerField()
     total_malicious = serializers.IntegerField()
     total_suspicious = serializers.IntegerField()
+    
+    # New fields needed by frontend
+    total_suspicious_domains = serializers.IntegerField(required=False, default=0)
+    total_phishing_domains = serializers.IntegerField(required=False, default=0)
+    total_impersonations = serializers.IntegerField(required=False, default=0)
+    active_alerts = serializers.IntegerField(required=False, default=0)
+    
     org_name = serializers.CharField(required=False, default="")
     latest_reports = serializers.ListField(child=VirusTotalReportSerializer(), required=False)
     targets_by_status = serializers.DictField(child=serializers.IntegerField())
