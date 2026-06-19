@@ -15,6 +15,20 @@ class MobileScanAdmin(admin.ModelAdmin):
     list_filter = ['status', 'source']
     search_fields = ['file_name', 'app_name', 'package_name']
     inlines = [MobileFindingInline]
+    
+    def save_model(self, request, obj, form, change):
+        if not obj.file_name and obj.apk_file:
+            import os
+            obj.file_name = os.path.basename(obj.apk_file.name)
+        if not obj.scan_hash and obj.apk_file:
+            import hashlib
+            obj.scan_hash = hashlib.md5(obj.apk_file.name.encode()).hexdigest()
+        
+        super().save_model(request, obj, form, change)
+        
+        if obj.apk_file and not obj.vt_scan_id:
+            from .tasks import scan_apk_virustotal
+            scan_apk_virustotal.delay(obj.id)
 
 
 @admin.register(MobileFinding)

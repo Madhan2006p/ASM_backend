@@ -12,6 +12,7 @@ class Organization(models.Model):
         blank=True,
         help_text="Enter domains separated by commas (e.g., example.com,test.org)",
     )
+    logo = models.ImageField(upload_to='logos/', null=True, blank=True, help_text="Upload organization logo")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -54,13 +55,13 @@ class UserProfile(models.Model):
         related_name="asm_profile",
     )
     phone_number = models.CharField(max_length=50, blank=True)
+    profile_photo = models.ImageField(upload_to='profile_photos/', null=True, blank=True)
     features = models.TextField(
         blank=True,
         default="",
         help_text="Comma-separated feature IDs. E.g., 1,2,3\n"
-        "1=Subdomains, 2=Endpoints, 3=Open Ports, 4=Directories, \n"
-        "5=Technologies, 6=Vulnerabilities, 7=SSL Certificates, \n"
-        "8=Email Security, 9=Scan History, 10=Surface Web Monitoring",
+        "1=Asset Discovery, 2=Mobile Security, 3=Email Security, \n"
+        "4=Internal Asset Discovery, 5=Surface Web Monitoring, 6=Brand Monitoring",
     )
 
     def __str__(self):

@@ -149,15 +149,9 @@ class EmailSecurityResultSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "domain",
-            "root_txt",
             "spf",
             "dmarc",
             "mx",
-            "dkim_selector1",
-            "dkim_default",
-            "smtp_hosts",
-            "smtp_port_scan",
-            "smtp_open_relay",
             "smtp_starttls",
             "created_at",
         ]

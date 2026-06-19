@@ -2,18 +2,16 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
 from .views import (
-    RepoEventViewSet,
-    RepoScanViewSet,
-    SurfaceMonitorConfigViewSet,
-    GitHubRepositoryViewSet,
+    SpiderfootScanViewSet,
+    SpiderfootResultViewSet,
+    SpiderfootStatsView,
 )
 
 router = DefaultRouter()
-router.register(r'configs', SurfaceMonitorConfigViewSet, basename='surface-config')
-router.register(r'repos', GitHubRepositoryViewSet, basename='surface-repo')
-router.register(r'scans', RepoScanViewSet, basename='surface-scan')
-router.register(r'events', RepoEventViewSet, basename='surface-event')
+router.register(r'scans', SpiderfootScanViewSet, basename='spiderfoot-scan')
+router.register(r'results', SpiderfootResultViewSet, basename='spiderfoot-result')
 
 urlpatterns = [
+    path('stats/', SpiderfootStatsView.as_view(), name='spiderfoot-stats'),
     path('', include(router.urls)),
 ]

@@ -45,7 +45,7 @@ class OrganizationAdmin(admin.ModelAdmin):
     ordering = ("name",)
 
     fieldsets = (
-        (None, {"fields": ("name", "description", "is_active")}),
+        (None, {"fields": ("name", "description", "logo", "is_active")}),
         (
             "Domains",
             {

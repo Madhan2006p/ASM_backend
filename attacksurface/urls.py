@@ -22,14 +22,18 @@ from .views import (
     ScanListView,
     ScanStatusView,
     ScanTriggerView,
+    AdminScanTriggerView,
     SendVulnerabilitiesToFaradayView,
     SubdomainListView,
     TechnologyListView,
     VulnerabilityListView,
     ToolsHealthView,
+    ExecutiveDashboardSummaryView,
+    ScanReportView,
 )
 
 urlpatterns = [
+    path("executive-dashboard/", ExecutiveDashboardSummaryView.as_view(), name="attacksurface-executive-dashboard-summary"),
     path("subdomains/", SubdomainListView.as_view(), name="attack-surface-subdomains"),
     path("endpoints/", EndpointListView.as_view(), name="attack-surface-endpoints"),
     path("open-ports/", PortListView.as_view(), name="attack-surface-ports"),
@@ -42,7 +46,9 @@ urlpatterns = [
     path("domains/", MonitoredDomainListView.as_view(), name="attack-surface-domains"),
     path("domains/quick-scan/", DomainQuickScanView.as_view(), name="attack-surface-domain-quick-scan"),
     path("scan/", ScanTriggerView.as_view(), name="attack-surface-scan-trigger"),
+    path("admin-scan/", AdminScanTriggerView.as_view(), name="attack-surface-admin-scan-trigger"),
     path("scan/<int:id>/", ScanStatusView.as_view(), name="attack-surface-scan-status"),
+    path("scan/<int:scan_id>/report/", ScanReportView.as_view(), name="attack-surface-scan-report"),
     path("scan-history/", ScanHistoryView.as_view(), name="attack-surface-scan-history"),
     path("tools-health/", ToolsHealthView.as_view(), name="attacksurface-tools-health"),
     path("clear-db/", ClearDatabaseView.as_view(), name="attacksurface-clear-db"),

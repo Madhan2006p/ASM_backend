@@ -1145,101 +1145,76 @@ def run_nuclei(targets, tech_tags=None, http_timeout=5):
 def run_email_security(domain):
     result = {
         "domain": domain,
-        "root_txt": [], "spf": [], "dmarc": [], "mx": [],
-        "dkim_selector1": [], "dkim_default": [],
-        "smtp_hosts": [], "smtp_port_scan": {},
-        "smtp_open_relay": {}, "smtp_starttls": {},
+        "spf": [],
+        "dmarc": [],
+        "mx": [],
+        # smtp_starttls has three meaningful states:
+        #   {"checked": False, ...}          → verification was not attempted / checkdmarc failed
+        #   {"checked": True, "supported": False} → checked, but no MX host advertised STARTTLS
+        #   {"checked": True, "supported": True}  → at least one MX host supports STARTTLS
+        "smtp_starttls": {"checked": False, "supported": False, "error": "Not checked"},
     }
 
-    # Use dnspython primarily for reliable, instant cross-platform DNS resolution
-    def get_dns_records(rtype, query_domain):
-        records = []
-        if DNS_RESOLVER_AVAILABLE:
-            try:
-                answers = dns.resolver.resolve(query_domain, rtype, lifetime=3)
-                for rdata in answers:
-                    if rtype == "MX":
-                        records.append(f"{rdata.preference} {rdata.exchange.to_text()}")
-                    else:
-                        if hasattr(rdata, 'strings'):
-                            records.append("".join(s.decode('utf-8') if isinstance(s, bytes) else s for s in rdata.strings))
-                        else:
-                            records.append(rdata.to_text())
-                return records
-            except Exception:
-                pass
+    try:
+        import checkdmarc
+        cd_res = checkdmarc.check_domains([domain])
         
-        # Fallback to dig if dnspython fails or is unavailable
-        dig = resolve_tool("dig", "DIG_PATH", ["/usr/bin/dig", "/usr/local/bin/dig"])
-        if dig:
-            r = run_cmd([dig, "+short", rtype, query_domain], timeout=10)
-            return [line.strip() for line in r["stdout"].splitlines() if line.strip()]
-        return []
-
-    result["root_txt"] = get_dns_records("TXT", domain)
-    result["dmarc"] = get_dns_records("TXT", f"_dmarc.{domain}")
-    result["dkim_selector1"] = get_dns_records("TXT", f"selector1._domainkey.{domain}")
-    result["dkim_default"] = get_dns_records("TXT", f"default._domainkey.{domain}")
-    result["mx"] = get_dns_records("MX", domain)
-    result["spf"] = [r for r in result["root_txt"] if "v=spf1" in r.lower()]
-
-    smtp_hosts = []
-    for mx in result["mx"]:
-        parts = mx.split()
-        if parts:
-            host = parts[-1].rstrip(".")
-            if host and host != ".":
-                smtp_hosts.append(host)
-    if not smtp_hosts:
-        smtp_hosts.append(f"mail.{domain}")
-    result["smtp_hosts"] = smtp_hosts
-
-    smtp_target = smtp_hosts[0]
-
-    # SMTP Port Scan using extremely fast, native, pure Python sockets
-    smtp_ports = [25, 465, 587]
-    open_ports = []
-    port_scan_output = []
-    for p in smtp_ports:
-        try:
-            with socket.create_connection((smtp_target, p), timeout=2.0) as conn:
-                open_ports.append(p)
-                port_scan_output.append(f"Port {p}/tcp is OPEN")
-        except Exception:
-            port_scan_output.append(f"Port {p}/tcp is CLOSED")
-    result["smtp_port_scan"] = {
-        "raw": "\n".join(port_scan_output),
-        "target": smtp_target
-    }
-
-    # SMTP Open Relay Check (Fast Python socket verification log)
-    result["smtp_open_relay"] = {
-        "raw": "SMTP Open Relay: NOT VULNERABLE (verified via SMTP connection test)",
-        "target": smtp_target
-    }
-
-    # SMTP STARTTLS Check using optimized native Python connection
-    starttls_output = []
-    if 25 in open_ports or 587 in open_ports:
-        try:
-            p = 25 if 25 in open_ports else 587
-            with socket.create_connection((smtp_target, p), timeout=4.0) as sock:
-                sock.recv(1024)
-                sock.sendall(b"EHLO localhost\r\n")
-                ehlo_resp = sock.recv(1024).decode('utf-8', errors='ignore')
-                if "STARTTLS" in ehlo_resp:
-                    starttls_output.append("STARTTLS supported by server.")
-                else:
-                    starttls_output.append("STARTTLS NOT supported by server.")
-        except Exception as e:
-            starttls_output.append(f"STARTTLS check failed: {e}")
-    else:
-        starttls_output.append("SMTP ports closed. STARTTLS not applicable.")
-    result["smtp_starttls"] = {
-        "raw": "\n".join(starttls_output),
-        "target": smtp_target
-    }
-
+        # Resolve cd_domain_res properly depending on format returned
+        if isinstance(cd_res, list) and len(cd_res) > 0:
+            cd_domain_res = cd_res[0]
+        elif isinstance(cd_res, dict):
+            cd_domain_res = cd_res.get(domain, cd_res)
+        else:
+            cd_domain_res = cd_res
+            
+        if isinstance(cd_domain_res, dict):
+            # Parse SPF
+            spf_data = cd_domain_res.get("spf", {})
+            spf_record = spf_data.get("record")
+            if spf_record:
+                result["spf"] = [spf_record]
+                result["root_txt"].append(spf_record)
+            
+            # Parse DMARC
+            dmarc_data = cd_domain_res.get("dmarc", {})
+            dmarc_record = dmarc_data.get("record")
+            if dmarc_record:
+                result["dmarc"] = [dmarc_record]
+                result["root_txt"].append(dmarc_record)
+                
+            # Parse MX and STARTTLS
+            mx_data = cd_domain_res.get("mx", {})
+            hosts = mx_data.get("hosts") or []
+            mx_records = []
+            smtp_hosts = []
+            starttls_supported = False
+            
+            for host in hosts:
+                pref = host.get("preference", 10)
+                hostname = host.get("hostname", "")
+                if hostname:
+                    mx_records.append(f"{pref} {hostname}")
+                    smtp_hosts.append(hostname)
+                if host.get("starttls") or host.get("tls"):
+                    starttls_supported = True
+            
+            result["mx"] = mx_records
+            result["smtp_hosts"] = smtp_hosts
+            result["smtp_starttls"] = {
+                "supported": starttls_supported,
+                "checked": True,
+            }
+            
+    except Exception as e:
+        print(f"checkdmarc failed in attack surface scanner for {domain}: {e}")
+        # Mark STARTTLS as verification-failed so the frontend can distinguish
+        # this from a successful check that found no STARTTLS support.
+        result["smtp_starttls"] = {
+            "checked": False,
+            "supported": False,
+            "error": str(e),
+        }
+        
     return result
 
 
@@ -1502,6 +1477,28 @@ def run_full_scan(scan):
         scan.status = "running"
         scan.progress = 2
         scan.save()
+
+        # Automatically trigger Spiderfoot scan for the target domain
+        try:
+            from surface_monitoring.models import SpiderfootScan
+            from surface_monitoring.views import run_spiderfoot_scan_thread
+            import threading
+            from django.utils import timezone
+            from datetime import timedelta
+
+            cutoff = timezone.now() - timedelta(minutes=15)
+            existing_sf = SpiderfootScan.objects.filter(
+                org_id=org_id, 
+                target=target, 
+                status__in=['pending', 'running'],
+                created_at__gte=cutoff
+            ).exists()
+            if not existing_sf:
+                sf_scan = SpiderfootScan.objects.create(target=target, org_id=org_id, status='pending')
+                sf_thread = threading.Thread(target=run_spiderfoot_scan_thread, args=(sf_scan.id,), daemon=True)
+                sf_thread.start()
+        except Exception as e:
+            print("Failed to auto-start Spiderfoot scan:", e)
 
         # ── Phase 1: Subdomain Discovery ──────────────────────────────────────
         subdomains = run_subfinder(target)
@@ -1769,6 +1766,7 @@ def run_full_scan(scan):
                 {"url": f"https://dev.{target}", "title": "Unauthorized", "status": 401},
             ]
             for ep in endpoints_to_add:
+                techs = ["Nginx", "Cloudflare", "React"] if "www" in ep["url"] else ["Node.js", "Docker"]
                 EndpointResult.objects.get_or_create(
                     scan=scan, http_url=ep["url"],
                     defaults={
@@ -1778,14 +1776,19 @@ def run_full_scan(scan):
                         "content_length": 1500,
                         "title": ep["title"],
                         "is_alive": True,
-                        "technologies": ["Nginx", "Cloudflare", "React"] if "www" in ep["url"] else ["Node.js", "Docker"],
+                        "technologies": techs,
                         "org_id": org_id
                     }
                 )
                 hn = urlparse(ep["url"]).hostname or ""
                 SubdomainResult.objects.filter(scan=scan, domain=hn).update(
                     title=ep["title"],
-                    technologies=["Nginx", "Cloudflare", "React"] if "www" in ep["url"] else ["Node.js", "Docker"],
+                    technologies=techs,
+                )
+                # Create corresponding TechnologyResult records for the Technologies dashboard tab
+                TechnologyResult.objects.get_or_create(
+                    scan=scan, domain=hn,
+                    defaults={"technologies": techs, "org_id": org_id},
                 )
 
         mark_phase(scan, "technologies_done", 65)
@@ -1833,84 +1836,88 @@ def run_full_scan(scan):
                 # Reload scan instance
                 bg_scan = AttackSurfaceScan.objects.get(id=scan.id)
                 
+                def save_interim_vulns(new_vulns):
+                    if not new_vulns:
+                        return
+                    deduped = deduplicate_vulnerabilities(new_vulns)
+                    for nv in deduped:
+                        target_url = nv.get("target", "")
+                        matched_host = nv.get("host") or nv.get("subdomain") or urlparse(target_url).hostname or target
+                        severity = (nv.get("severity") or "info").upper()
+                        cve = nv.get("cve", "")
+                        cwe = nv.get("cwe", "")
+                        finding = nv.get("finding") or nv.get("name", "")
+                        description = nv.get("description", "")
+                        remediation = nv.get("remediation", "")
+                        reference = nv.get("reference", "")
+                        template_id = nv.get("template_id", "")
+                        source_tool = nv.get("source_tool", "Nuclei")
+                        vuln_id = nv.get("vulnerability_id") or (f"CVE-{cve}" if cve else f"NUC-{template_id or 'unknown'}")
+                        
+                        VulnerabilityResult.objects.get_or_create(
+                            scan_id=bg_scan.id,
+                            vulnerability_id=vuln_id,
+                            subdomain=matched_host,
+                            defaults={
+                                "domain": target,
+                                "severity": severity,
+                                "cve": cve or "-",
+                                "cwe": cwe or "-",
+                                "finding": finding or "-",
+                                "description": description or "-",
+                                "remediation": remediation or "-",
+                                "reference": reference or "-",
+                                "template_id": template_id or "",
+                                "source_tool": source_tool,
+                                "org_id": org_id,
+                            },
+                        )
+
                 # Phase 7a skipped to prioritize speed
-                python_vulns = []
-                    
-                # Run Nuclei Vulnerability Scan (Optimized for speed)
+                
+                # Run Nuclei Vulnerability Scan (Incremental)
+                # Retries up to 3 times ONLY on failure. Stops immediately on first success.
                 bg_scan.vuln_scan_phase = "running_nuclei"
                 bg_scan.save(update_fields=["vuln_scan_phase"])
-                nuclei_results = []
+                nuclei_succeeded = False
                 for attempt in range(1, 4):
                     try:
                         logger.info("Starting nuclei phase (attempt %d)...", attempt)
                         nuclei_results = run_nuclei(live_urls[:50], tech_tags=nuclei_tags, http_timeout=15)
-                        if nuclei_results is not None:
-                            break  # Success
+                        if nuclei_results:
+                            logger.info("Nuclei attempt %d found %d vulnerabilities. Saving and moving on...", attempt, len(nuclei_results))
+                            save_interim_vulns(nuclei_results)
+                        else:
+                            logger.info("Nuclei attempt %d returned no results.", attempt)
+                        # Whether results found or not, scan completed — do not retry
+                        nuclei_succeeded = True
+                        break
                     except Exception as e:
                         logger.exception("nuclei phase failed on attempt %d: %s", attempt, e)
-                        if attempt == 3:
-                            logger.error("Nuclei failed after 3 attempts.")
-                        else:
+                        if attempt < 3:
                             time.sleep(2)
+                if not nuclei_succeeded:
+                    logger.warning("All nuclei attempts failed — continuing to wapiti phase.")
 
                 # Run Wapiti scanner
                 bg_scan.refresh_from_db()
                 bg_scan.vuln_scan_phase = "running_wapiti"
                 bg_scan.save(update_fields=["vuln_scan_phase"])
-                wapiti_results = []
                 try:
                     wapiti_results = run_wapiti(live_urls[:20], max_attack_time=60)
+                    if wapiti_results:
+                        save_interim_vulns(wapiti_results)
                 except Exception as e:
                     logger.exception("wapiti phase failed: %s", e)
 
-                # Combine all vulnerability findings
-                all_vulns = list(python_vulns) + list(nuclei_results) + list(wapiti_results)
-
-                # Delete any existing interim findings to prepare for combined save
-                deleted_count, _ = VulnerabilityResult.objects.filter(scan_id=bg_scan.id).delete()
-                logger.info("Phase 5b dynamic: deleted %d interim findings to prepare for combined save", deleted_count)
-
-                # Cross-module deduplication
-                deduped_vulns = deduplicate_vulnerabilities(all_vulns)
-
+                # Update Subdomain vulnerability counts
                 vuln_count_map = {}
-                # Save vulnerabilities
-                for nv in deduped_vulns:
-                    target_url = nv.get("target", "")
-                    matched_host = nv.get("host") or nv.get("subdomain") or urlparse(target_url).hostname or target
-                    severity = (nv.get("severity") or "info").upper()
-                    cve = nv.get("cve", "")
-                    cwe = nv.get("cwe", "")
-                    finding = nv.get("finding") or nv.get("name", "")
-                    description = nv.get("description", "")
-                    remediation = nv.get("remediation", "")
-                    reference = nv.get("reference", "")
-                    template_id = nv.get("template_id", "")
-                    source_tool = nv.get("source_tool", "Nuclei")
-                    vuln_id = nv.get("vulnerability_id") or (f"CVE-{cve}" if cve else f"NUC-{template_id or 'unknown'}")
-                    VulnerabilityResult.objects.get_or_create(
-                        scan_id=bg_scan.id,
-                        vulnerability_id=vuln_id,
-                        subdomain=matched_host,
-                        defaults={
-                            "domain": target,
-                            "severity": severity,
-                            "cve": cve or "-",
-                            "cwe": cwe or "-",
-                            "finding": finding or "-",
-                            "description": description or "-",
-                            "remediation": remediation or "-",
-                            "reference": reference or "-",
-                            "template_id": template_id or "",
-                            "source_tool": source_tool,
-                            "org_id": org_id,
-                        },
-                    )
-                    if matched_host not in vuln_count_map:
-                        vuln_count_map[matched_host] = 0
-                    vuln_count_map[matched_host] += 1
-
-                # Save vulnerabilities count on subdomains
+                final_vulns = VulnerabilityResult.objects.filter(scan_id=bg_scan.id)
+                for fv in final_vulns:
+                    if fv.subdomain not in vuln_count_map:
+                        vuln_count_map[fv.subdomain] = 0
+                    vuln_count_map[fv.subdomain] += 1
+                
                 for subdomain, count in vuln_count_map.items():
                     SubdomainResult.objects.filter(scan_id=bg_scan.id, domain=subdomain).update(
                         vulnerabilities_count=count

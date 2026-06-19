@@ -5,7 +5,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import Organization, OrganizationMembership, UserDomain, UserProfile
-from .permissions import IsOrgAdmin
+from .permissions import IsOrgAdmin, IsAuthenticatedAndOrgMember
 from .serializers import (
     OrganizationMembershipSerializer,
     OrganizationSerializer,
@@ -23,7 +23,7 @@ def get_tokens_for_user(user):
     }
 
 
-def get_user_data(user):
+def get_user_data(user, request=None):
     membership = (
         user.memberships.select_related("organization").first()
         if hasattr(user, "memberships") and user.pk
@@ -32,10 +32,15 @@ def get_user_data(user):
     org_id = "1"
     org_name = "Default Org"
     role = "member"
+    logo_url = None
     if membership:
         org_id = membership.organization.org_id
         org_name = membership.organization.name
         role = membership.role
+        if membership.organization.logo:
+            logo_url = membership.organization.logo.url
+            if request:
+                logo_url = request.build_absolute_uri(logo_url)
 
     # Ensure UserProfile exists for feature support & domain admin fields
     profile = getattr(user, "asm_profile", None)
@@ -47,10 +52,24 @@ def get_user_data(user):
     if profile.features:
         features = [f.strip() for f in profile.features.split(",") if f.strip()]
 
-    # Load admin-assigned domains the user is allowed to scan
-    assigned_domains = list(
-        UserDomain.objects.filter(user=user).values_list("domain__domain", flat=True)
-    )
+    # Load organization-shared domains (UserDomain pool + Organization.allowed_domains)
+    assigned_domains = set()
+    if membership and membership.organization:
+        if membership.organization.allowed_domains:
+            for d in membership.organization.allowed_domains.split(","):
+                d_str = d.strip()
+                if d_str:
+                    assigned_domains.add(d_str)
+        member_user_ids = OrganizationMembership.objects.filter(
+            organization=membership.organization
+        ).values_list("user", flat=True)
+        for d in UserDomain.objects.filter(user_id__in=member_user_ids).values_list("domain__domain", flat=True):
+            assigned_domains.add(d)
+    assigned_domains = list(assigned_domains)
+
+    profile_photo_url = profile.profile_photo.url if profile and profile.profile_photo else None
+    if request and profile_photo_url:
+        profile_photo_url = request.build_absolute_uri(profile_photo_url)
 
     return {
         "id": user.id,
@@ -63,6 +82,9 @@ def get_user_data(user):
         "role": role,
         "features": features,
         "assigned_domains": assigned_domains,
+        "logo_url": logo_url,
+        "profile_photo_url": profile_photo_url,
+        "is_superuser": user.is_superuser,
     }
 
 
@@ -79,7 +101,7 @@ class RegisterView(generics.CreateAPIView):
         return Response(
             {
                 "tokens": tokens,
-                "user": get_user_data(user),
+                "user": get_user_data(user, request),
             },
             status=status.HTTP_201_CREATED,
         )
@@ -111,7 +133,7 @@ class LoginView(APIView):
         return Response(
             {
                 "tokens": tokens,
-                "user": get_user_data(user),
+                "user": get_user_data(user, request),
             }
         )
 
@@ -134,14 +156,35 @@ class ProfileView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        return Response(get_user_data(request.user))
+        return Response(get_user_data(request.user, request))
+
+    def put(self, request):
+        user = request.user
+        profile = getattr(user, "asm_profile", None)
+        if not profile:
+            profile = UserProfile.objects.create(user=user)
+        
+        # Handle profile photo upload
+        if 'profile_photo' in request.FILES:
+            profile.profile_photo = request.FILES['profile_photo']
+            profile.save()
+
+        # Handle other fields (name, phone, etc) if needed
+        if 'name' in request.data:
+            user.first_name = request.data['name']
+            user.save()
+        if 'phone_number' in request.data:
+            profile.phone_number = request.data['phone_number']
+            profile.save()
+
+        return Response(get_user_data(user, request))
 
 
 class CheckAuthView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        return Response({"authenticated": True, "user": get_user_data(request.user)})
+        return Response({"authenticated": True, "user": get_user_data(request.user, request)})
 
 
 # ─── Organization Management Views ────────────────────────────────────────────
@@ -166,10 +209,29 @@ class OrganizationListView(APIView):
                 {"error": "Organization name is required"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        
+        logo = request.FILES.get("logo")
+        logo_file = None
+        if logo:
+            import os
+            ext = os.path.splitext(logo.name)[1].lower()
+            if ext != '.svg':
+                return Response({"error": "Only SVG format is allowed for logos."}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                content = logo.read(1000).decode('utf-8', errors='ignore')
+                logo.seek(0)
+                if '<svg' not in content.lower():
+                    return Response({"error": "Invalid SVG file content."}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                return Response({"error": "Failed to read SVG file content."}, status=status.HTTP_400_BAD_REQUEST)
+            logo_file = logo
+
         org = Organization.objects.create(
-            name=name, org_id=name.lower().replace(" ", "-")[:50]
+            name=name, 
+            org_id=name.lower().replace(" ", "-")[:50],
+            logo=logo_file
         )
-        OrganizationMembership.objects.create(
+        OrganizationMembership.objects.get_or_create(
             user=request.user, organization=org, role="admin"
         )
         serializer = OrganizationSerializer(org, context={"request": request})
@@ -192,16 +254,38 @@ class OrganizationDetailView(APIView):
         return Response(serializer.data)
 
     def patch(self, request, org_id):
-        membership = request.user.memberships.filter(
-            organization__org_id=org_id, role="admin"
-        ).first()
-        if not membership:
-            return Response({"error": "Not authorized"}, status=403)
-        org = membership.organization
+        if request.user.is_superuser:
+            org = Organization.objects.filter(org_id=org_id).first()
+            if not org:
+                return Response({"error": "Organization not found"}, status=404)
+        else:
+            membership = request.user.memberships.filter(
+                organization__org_id=org_id, role="admin"
+            ).first()
+            if not membership:
+                return Response({"error": "Not authorized"}, status=403)
+            org = membership.organization
+            
         name = request.data.get("name")
         if name:
             org.name = name.strip()
-            org.save()
+            
+        logo = request.FILES.get("logo")
+        if logo:
+            import os
+            ext = os.path.splitext(logo.name)[1].lower()
+            if ext != '.svg':
+                return Response({"error": "Only SVG format is allowed for logos."}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                content = logo.read(1000).decode('utf-8', errors='ignore')
+                logo.seek(0)
+                if '<svg' not in content.lower():
+                    return Response({"error": "Invalid SVG file content."}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                return Response({"error": "Failed to read SVG file content."}, status=status.HTTP_400_BAD_REQUEST)
+            org.logo = logo
+            
+        org.save()
         serializer = OrganizationSerializer(org, context={"request": request})
         return Response(serializer.data)
 
@@ -294,16 +378,12 @@ class OrganizationMembersView(APIView):
 
 # All available features with their IDs, names, and module keys
 AVAILABLE_FEATURES = [
-    {"id": "1", "name": "Subdomains", "module": "subdomains"},
-    {"id": "2", "name": "Endpoints", "module": "endpoints"},
-    {"id": "3", "name": "Open Ports", "module": "open_ports"},
-    {"id": "4", "name": "Directories", "module": "directories"},
-    {"id": "5", "name": "Technologies", "module": "technologies"},
-    {"id": "6", "name": "Vulnerabilities", "module": "vulnerabilities"},
-    {"id": "7", "name": "SSL Certificates", "module": "ssl_certificates"},
-    {"id": "8", "name": "Email Security", "module": "email_security"},
-    {"id": "9", "name": "Scan History", "module": "scan_history"},
-    {"id": "10", "name": "Surface Web Monitoring", "module": "surface_web"},
+    {"id": "1", "name": "Asset Discovery", "module": "asset_discovery", "description": "Discover subdomains, endpoints, open ports, directories, technologies, vulnerabilities, and SSL certificates"},
+    {"id": "2", "name": "Mobile Security", "module": "apk_scanner", "description": "Scan mobile apps for security vulnerabilities"},
+    {"id": "3", "name": "Email Security", "module": "email_security", "description": "Analyze email security configurations and records"},
+    {"id": "4", "name": "Internal Asset Discovery", "module": "internal_asset", "description": "Discover internal networks, services, active directory, and assets"},
+    {"id": "5", "name": "Surface Web Monitoring", "module": "surface_web", "description": "Monitor brand presence on the surface web"},
+    {"id": "6", "name": "Brand Monitoring", "module": "brand_monitoring", "description": "Monitor brand abuse, anti-malware, and phishing"},
 ]
 
 
@@ -314,17 +394,17 @@ class ListFeaturesView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        return Response(AVAILABLE_FEATURES)
+        return Response({"features": AVAILABLE_FEATURES})
 
 
 class UserFeatureManagementView(APIView):
     """
-    Manage features for a specific user (admin only).
-    - GET: List the user's granted features
-    - POST (give): Grant a feature to the user
-    - POST (take): Revoke a feature from the user
+    Manage features for a specific user.
+    - GET: List the user's granted features (viewable by any org member)
+    - POST (give): Grant a feature to the user (admin only)
+    - POST (take): Revoke a feature from the user (admin only)
     """
-    permission_classes = [permissions.IsAuthenticated, IsOrgAdmin]
+    permission_classes = [permissions.IsAuthenticated, IsAuthenticatedAndOrgMember]
 
     def get(self, request, user_id):
         try:
@@ -366,13 +446,13 @@ class UserFeatureManagementView(APIView):
         except User.DoesNotExist:
             return Response({"error": "User not found"}, status=404)
 
-        # Ensure same org
+        # Ensure requester is an admin in the target user's organization
         if not request.user.is_superuser:
             admin_membership = request.user.memberships.filter(
-                organization__memberships__user=target_user
+                organization__memberships__user=target_user, role="admin"
             ).first()
             if not admin_membership:
-                return Response({"error": "User is not in your organization"}, status=403)
+                return Response({"error": "Only organization administrators can modify user features."}, status=403)
 
         profile = getattr(target_user, "asm_profile", None)
         if not profile:
@@ -395,6 +475,17 @@ class UserFeatureManagementView(APIView):
             current_features = set(f.strip() for f in profile.features.split(",") if f.strip())
 
         if action == "give":
+            # Organization admins can only assign features that they themselves possess
+            if not request.user.is_superuser:
+                admin_profile = getattr(request.user, "asm_profile", None)
+                admin_features = set()
+                if admin_profile and admin_profile.features:
+                    admin_features = set(f.strip() for f in admin_profile.features.split(",") if f.strip())
+                if feature_id not in admin_features:
+                    return Response(
+                        {"error": "You are not authorized to assign this feature. Your organization has not been granted this feature by the super admin."},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
             current_features.add(feature_id)
             message = f'Feature "{valid["name"]}" granted to {target_user.username}'
         elif action == "take":
@@ -439,6 +530,13 @@ class AdminCreateUserView(APIView):
             )
         if role not in ("admin", "member", "viewer"):
             role = "member"
+
+        # Super admin only can create admin user for an organization
+        if role == "admin" and not request.user.is_superuser:
+            return Response(
+                {"error": "Only super admins can create admin users."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         # Validate org_id — the admin must be admin of this org OR be superuser
         if request.user.is_superuser:
@@ -502,7 +600,7 @@ class ListOrganizationUsersView(APIView):
     """
     List all users belonging to a specific organization (admin only).
     """
-    permission_classes = [permissions.IsAuthenticated, IsOrgAdmin]
+    permission_classes = [permissions.IsAuthenticated, IsAuthenticatedAndOrgMember]
 
     def get(self, request, org_id):
         # Verify admin has access to this org
@@ -513,7 +611,7 @@ class ListOrganizationUsersView(APIView):
                 return Response({"error": "Organization not found"}, status=404)
         else:
             membership = request.user.memberships.filter(
-                organization__org_id=org_id, role="admin"
+                organization__org_id=org_id
             ).first()
             if not membership:
                 return Response({"error": "Not authorized"}, status=403)
@@ -525,14 +623,145 @@ class ListOrganizationUsersView(APIView):
 
         data = []
         for m in members:
+            profile = getattr(m.user, "asm_profile", None)
+            photo_url = None
+            if profile and profile.profile_photo:
+                photo_url = profile.profile_photo.url
+                if request:
+                    photo_url = request.build_absolute_uri(photo_url)
             data.append({
                 "id": m.user.id,
                 "username": m.user.username,
                 "email": m.user.email,
                 "full_name": f"{m.user.first_name} {m.user.last_name}".strip(),
                 "is_active": m.user.is_active,
+                "is_superuser": m.user.is_superuser,
                 "role": m.role,
+                "organization": m.organization.name,
+                "profile_photo_url": photo_url,
                 "joined_at": m.joined_at,
             })
 
         return Response(data)
+
+class AdminAllUsersView(APIView):
+    """
+    List all users across all organizations (superuser only).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        if not request.user.is_superuser:
+            return Response({"error": "Not authorized"}, status=403)
+
+        members = OrganizationMembership.objects.select_related("user", "organization").all()
+        
+        data = []
+        for m in members:
+            logo_url = None
+            if m.organization.logo:
+                logo_url = m.organization.logo.url
+                if request:
+                    logo_url = request.build_absolute_uri(logo_url)
+            data.append({
+                "id": m.user.id,
+                "username": m.user.username,
+                "email": m.user.email,
+                "full_name": f"{m.user.first_name} {m.user.last_name}".strip(),
+                "is_active": m.user.is_active,
+                "is_superuser": m.user.is_superuser,
+                "role": m.role,
+                "organization": m.organization.name,
+                "organization_id": m.organization.org_id,
+                "logo_url": logo_url,
+                "joined_at": m.joined_at,
+            })
+
+        return Response(data)
+
+class UserDomainManagementView(APIView):
+    """
+    Manage domains for a specific user (superuser only).
+    - GET: List the user's assigned domains
+    - POST (action=give): Assign a domain
+    - POST (action=take): Remove a domain
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, user_id):
+        if not request.user.is_superuser:
+            return Response({"error": "Not authorized"}, status=403)
+        try:
+            target_user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=404)
+        
+        from .models import UserDomain
+        domains = UserDomain.objects.filter(user=target_user).values_list("domain__domain", flat=True)
+        return Response({"user_id": target_user.id, "domains": list(domains)})
+
+    def post(self, request, user_id):
+        if not request.user.is_superuser:
+            return Response({"error": "Not authorized"}, status=403)
+        try:
+            target_user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=404)
+
+        action = request.data.get("action", "")
+        domain_name = request.data.get("domain", "").strip().lower()
+
+        if not domain_name:
+            return Response({"error": "domain is required"}, status=400)
+
+        import re
+        domain_name = re.sub(r'^https?://', '', domain_name)
+        domain_name = domain_name.split('/')[0].split(':')[0]
+        domain_name = re.sub(r'^www\.', '', domain_name)
+
+        from .models import Domain, UserDomain
+
+        if action == "give":
+            domain_obj, _ = Domain.objects.get_or_create(domain=domain_name)
+            UserDomain.objects.get_or_create(user=target_user, domain=domain_obj)
+            return Response({"message": f"Domain {domain_name} assigned to user"})
+        elif action == "take":
+            try:
+                domain_obj = Domain.objects.get(domain=domain_name)
+                UserDomain.objects.filter(user=target_user, domain=domain_obj).delete()
+                return Response({"message": f"Domain {domain_name} removed from user"})
+            except Domain.DoesNotExist:
+                return Response({"message": "Domain not found"})
+        else:
+            return Response({"error": "action must be 'give' or 'take'"}, status=400)
+
+
+class UserRoleManagementView(APIView):
+    """
+    Manage user roles within an organization.
+    Only superusers or org admins can change roles.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def patch(self, request, user_id):
+        if not request.user.is_superuser:
+            return Response({"error": "Only superusers can modify roles."}, status=403)
+
+        role = request.data.get("role")
+        if role not in ("admin", "member", "viewer"):
+            return Response({"error": "Invalid role"}, status=400)
+
+        target_user = get_object_or_404(User, id=user_id)
+        
+        # Currently the system assumes 1 organization per user in the frontend, so we just update their first membership
+        membership = OrganizationMembership.objects.filter(user=target_user).first()
+        if not membership:
+            return Response({"error": "User does not belong to any organization."}, status=400)
+
+        membership.role = role
+        membership.save(update_fields=["role"])
+
+        return Response({
+            "message": f"User role updated to {role}",
+            "role": role
+        })

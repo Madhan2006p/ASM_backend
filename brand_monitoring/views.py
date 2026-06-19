@@ -46,7 +46,7 @@ class BrandMonitorTargetViewSet(viewsets.ModelViewSet):
                 AttackSurfaceScan.objects.filter(org_id=org_id)
                 .values_list('target', flat=True)
             )
-            all_domains = monitored_domains | scanned_domains
+            all_domains = scanned_domains
             
             # Get existing BrandMonitorTarget domains
             existing_targets = BrandMonitorTarget.objects.filter(org_id=org_id)
