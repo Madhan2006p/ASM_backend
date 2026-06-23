@@ -39,6 +39,7 @@ from .serializers import (
     VulnerabilityResultSerializer,
 )
 from .services import run_full_scan
+from .deep_nuclei_scan import get_live_state, SCAN_PHASES
 
 
 def get_org_allowed_domains(user):
@@ -760,14 +761,23 @@ class ExecutiveDashboardSummaryView(APIView):
         selected_domain = request.query_params.get("domain", "").strip().lower()
 
         # Resolve scan IDs to use
+        # Only consider completed scans so the dashboard doesn't blank out during an active scan
+        completed_scans = AttackSurfaceScan.objects.filter(org_id=org_id, status='completed')
+        
         if selected_domain:
-            # Only use the latest scan for the selected domain
-            latest_scans = AttackSurfaceScan.objects.filter(org_id=org_id, target=selected_domain).order_by("-created_at")[:1]
+            latest_scans = completed_scans.filter(target=selected_domain).order_by("-created_at")[:1]
             scan_ids = [s.id for s in latest_scans]
+            # Fallback if no completed scans exist but there is a running one
+            if not scan_ids:
+                fallback = AttackSurfaceScan.objects.filter(org_id=org_id, target=selected_domain).order_by("-created_at")[:1]
+                scan_ids = [s.id for s in fallback]
         else:
-            # Use the latest scan for each domain in the organization
-            latest_scans = AttackSurfaceScan.objects.filter(org_id=org_id).values('target').annotate(latest_id=Max('id'))
+            latest_scans = completed_scans.values('target').annotate(latest_id=Max('id'))
             scan_ids = [item['latest_id'] for item in latest_scans]
+            # Fallback
+            if not scan_ids:
+                fallback = AttackSurfaceScan.objects.filter(org_id=org_id).values('target').annotate(latest_id=Max('id'))
+                scan_ids = [item['latest_id'] for item in fallback]
 
         # Calculate counts
         subdomains = SubdomainResult.objects.filter(scan_id__in=scan_ids)
@@ -775,14 +785,19 @@ class ExecutiveDashboardSummaryView(APIView):
         ports = PortResult.objects.filter(scan_id__in=scan_ids)
         vulns = VulnerabilityResult.objects.filter(scan_id__in=scan_ids)
         ssl_results = SSLResult.objects.filter(scan_id__in=scan_ids)
+        directories = DirectoryResult.objects.filter(scan_id__in=scan_ids)
+        technologies = TechnologyResult.objects.filter(scan_id__in=scan_ids)
 
         subdomains_count = subdomains.count()
         endpoints_count = endpoints.count()
+        directories_count = directories.count()
+        technologies_count = technologies.count()
+        
         ports_count = 0
         for p in ports:
             ports_count += len(p.ports) if isinstance(p.ports, list) else 0
 
-        total_assets = subdomains_count + endpoints_count + ports_count
+        total_assets = subdomains_count + endpoints_count + ports_count + directories_count
 
         if selected_domain:
             org_domains_count = 1
@@ -1013,6 +1028,10 @@ class ExecutiveDashboardSummaryView(APIView):
                 "total_assets": total_assets,
                 "organization_domains": org_domains_count,
                 "subdomains_count": domains_and_subdomains,
+                "endpoints_count": endpoints_count,
+                "directories_count": directories_count,
+                "technologies_count": technologies_count,
+                "ports_count": ports_count,
                 "vulnerabilities_count": total_vulns,
                 "expired_certs_count": expired_certs_count,
                 "ssl_expiring_soon": ssl_expiring_soon
@@ -1087,3 +1106,79 @@ class ScanReportView(APIView):
         })
 
 
+
+
+class NucleiStateView(APIView):
+    """
+    Returns the live deep nuclei scan state for a given scan ID.
+    Falls back to DB fields (nuclei_phase, nuclei_found) if the scan is not in memory
+    (e.g. after a server restart).
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAuthenticatedAndOrgMember]
+
+    def get(self, request, scan_id):
+        org_id = get_user_org_id(request)
+        scan = AttackSurfaceScan.objects.filter(id=scan_id, org_id=org_id).first()
+        if not scan:
+            return Response({"detail": "Not found."}, status=404)
+
+        # Try in-memory live state first
+        live = get_live_state(scan_id)
+
+        if live:
+            phase_idx = live.get("phase_idx", 0)
+            total_phases = live.get("total_phases", len(SCAN_PHASES))
+            remaining_est_hours = live.get("remaining_est_hours", 0)
+
+            # Build per-phase breakdown so frontend can show all phases with status
+            phases = []
+            for i, p in enumerate(SCAN_PHASES):
+                if i < phase_idx:
+                    st = "done"
+                elif i == phase_idx:
+                    st = "running"
+                else:
+                    st = "pending"
+                phases.append({
+                    "id": p["id"],
+                    "name": p["name"],
+                    "status": st,
+                    "est_hours": p["est_hours"],
+                })
+
+            # Time estimates
+            remaining_mins = round(remaining_est_hours * 60)
+            next_phase = SCAN_PHASES[phase_idx + 1]["name"] if phase_idx + 1 < len(SCAN_PHASES) else "Complete"
+
+            return Response({
+                "source": "live",
+                "status": live.get("status", "running"),
+                "phase_idx": phase_idx,
+                "phase_id": live.get("phase_id", ""),
+                "phase_name": live.get("phase_name", ""),
+                "total_phases": total_phases,
+                "total_found": live.get("total_found", 0),
+                "remaining_est_hours": remaining_est_hours,
+                "remaining_est_mins": remaining_mins,
+                "next_phase_name": next_phase,
+                "phases": phases,
+                "started_at": live.get("started_at", ""),
+                "completed_at": live.get("completed_at", ""),
+            })
+
+        # Fallback to DB fields
+        return Response({
+            "source": "db",
+            "status": "complete" if scan.vuln_scan_phase == "complete" else scan.vuln_scan_phase,
+            "phase_idx": None,
+            "phase_id": scan.nuclei_phase,
+            "phase_name": scan.nuclei_phase,
+            "total_phases": len(SCAN_PHASES),
+            "total_found": scan.nuclei_found,
+            "remaining_est_hours": 0,
+            "remaining_est_mins": 0,
+            "next_phase_name": "",
+            "phases": [],
+            "started_at": "",
+            "completed_at": "",
+        })

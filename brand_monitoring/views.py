@@ -11,7 +11,7 @@ from authentication.permissions import (
     get_user_org_id,
 )
 
-from .models import BrandMonitorTarget, VirusTotalReport, SuspiciousDomainReport, PhishingDomainReport, ImpersonatingScan, ImpersonatingAccountResult
+from .models import BrandMonitorTarget, VirusTotalReport, SuspiciousDomainReport, PhishingDomainReport, ImpersonatingScan, ImpersonatingAccountResult, AntiPhishingScan
 from .serializers import (
     BrandMonitorTargetSerializer,
     VirusTotalReportSerializer,
@@ -20,6 +20,7 @@ from .serializers import (
     PhishingDomainReportSerializer,
     ImpersonatingScanSerializer,
     ImpersonatingAccountResultSerializer,
+    AntiPhishingScanSerializer,
 )
 from .tasks import check_domain_virustotal, analyze_suspicious_domain_task, analyze_phishing_domain_task
 from authentication.models import Organization
@@ -239,7 +240,7 @@ class BrandMonitorTargetViewSet(viewsets.ModelViewSet):
         # Define what constitutes an active alert (could be expanded later)
         active_alerts = (total_malicious or 0) + (total_suspicious or 0)
 
-        serializer = BrandMonitorDashboardSerializer(data={
+        serializer = BrandMonitorDashboardSerializer(instance={
             'total_targets': targets.count(),
             'total_reports': reports.count(),
             'active_targets': targets.filter(is_active=True).count(),
@@ -250,11 +251,9 @@ class BrandMonitorTargetViewSet(viewsets.ModelViewSet):
             'total_impersonations': total_impersonations,
             'active_alerts': active_alerts,
             'org_name': org_name,
-            'latest_reports': VirusTotalReportSerializer(latest_reports, many=True).data,
+            'latest_reports': latest_reports,
             'targets_by_status': status_counts,
         })
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         return Response(serializer.data)
 
 
@@ -524,3 +523,50 @@ class ImpersonatingAccountResultViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+
+class AntiPhishingScanViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for Anti Phishing scans.
+    """
+    serializer_class = AntiPhishingScanSerializer
+    permission_classes = [permissions.IsAuthenticated, IsAuthenticatedAndOrgMember]
+    required_module = "brand_monitoring"
+
+    def get_queryset(self):
+        org_id = get_user_org_id(self.request)
+        return AntiPhishingScan.objects.filter(org_id=org_id)
+
+    def create(self, request, *args, **kwargs):
+        import threading
+        import logging as _logging
+        from .anti_phishing_tasks import run_anti_phishing_scan
+
+        org_id = get_user_org_id(request)
+        url = request.data.get("url", "").strip()
+
+        if not url:
+            return Response({"detail": "url is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        scan = AntiPhishingScan.objects.create(
+            url=url,
+            org_id=org_id,
+            status="pending",
+        )
+
+        def _bg(scan_id):
+            try:
+                run_anti_phishing_scan(scan_id)
+            except Exception as e:
+                _logging.getLogger(__name__).error(f"Anti Phishing scan {scan_id} failed: {e}")
+                try:
+                    AntiPhishingScan.objects.filter(id=scan_id).update(status="failed")
+                except Exception:
+                    pass
+
+        threading.Thread(target=_bg, args=(scan.id,), daemon=True).start()
+
+        return Response({
+            "status": "queued",
+            "scan_id": scan.id,
+            "url": scan.url,
+        }, status=status.HTTP_201_CREATED)

@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import BrandMonitorTarget, VirusTotalReport, SuspiciousDomainReport, PhishingDomainReport, ImpersonatingScan, ImpersonatingAccountResult
+from .models import BrandMonitorTarget, VirusTotalReport, SuspiciousDomainReport, PhishingDomainReport, ImpersonatingScan, ImpersonatingAccountResult, AntiPhishingScan
 
 
 class BrandMonitorTargetSerializer(serializers.ModelSerializer):
@@ -139,3 +139,9 @@ class ImpersonatingScanSerializer(serializers.ModelSerializer):
 
     def get_result_count(self, obj):
         return obj.results.count()
+
+class AntiPhishingScanSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AntiPhishingScan
+        fields = '__all__'
+        read_only_fields = ['id', 'status', 'org_id', 'created_at', 'completed_at']

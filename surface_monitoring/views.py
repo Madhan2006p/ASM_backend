@@ -25,13 +25,13 @@ def run_spiderfoot_scan_thread(scan_id):
         "/home/madhan/Desktop/spiderfoot/venv/bin/python",
         "/home/madhan/Desktop/spiderfoot/sf.py",
         "-s", scan.target,
-        "-m", "sfp_dnsresolve,sfp_whois,sfp_crt,sfp_github,sfp_securitytxt,sfp_pageinfo",
+        "-u", "all",
         "-q",
         "-o", "json"
     ]
     try:
-        # Give it up to 600 seconds to finish passive scan
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        # Give it up to 3600 seconds to finish passive scan
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         if result.returncode == 0:
             stdout_data = result.stdout.strip()
             if stdout_data:
@@ -45,10 +45,10 @@ def run_spiderfoot_scan_thread(scan_id):
                     for item in items:
                         results_to_create.append(SpiderfootResult(
                             scan=scan,
-                            data_type=item.get('type', 'Unknown'),
+                            data_type=str(item.get('type', 'Unknown'))[:255],
                             data_value=item.get('data', ''),
-                            module=item.get('module', 'Spiderfoot'),
-                            source=item.get('source', '')
+                            module=str(item.get('module', 'Spiderfoot'))[:255],
+                            source=str(item.get('source', ''))[:255]
                         ))
                     if results_to_create:
                         SpiderfootResult.objects.bulk_create(results_to_create)

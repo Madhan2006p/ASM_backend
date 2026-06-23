@@ -461,7 +461,7 @@ def run_httpx(domains):
     if not domains:
         return []
 
-    targets = list(set(domains[:200]))
+    targets = list(set(domains))
     urls = []
     for d in targets:
         if d.startswith("http://") or d.startswith("https://"):
@@ -495,7 +495,7 @@ def run_wappalyzer(targets):
     """Use the Node.js Wappalyzer implementation from reconnaissance app."""
     try:
         from reconnaissance.services.wappalyzer_scanner import run_wappalyzer as recon_run_wappalyzer
-        result = recon_run_wappalyzer(targets[:100])
+        result = recon_run_wappalyzer(targets)
         return result.get("parsed_output", {}).get("hosts", [])
     except Exception as e:
         logger.error(f"Failed to run Node Wappalyzer: {e}")
@@ -601,8 +601,8 @@ def run_nmap(targets):
                        getattr(settings, "NMAP_PATH", None))
     if not exe or not targets:
         return []
-    targets = targets[:20]
-    args = [exe, "--top-ports", "20", "-Pn", "-T4", "-oX", "-"]
+    targets = targets[:100]  # Increased from 20 to 100 to process more targets without crashing nmap
+    args = [exe, "--top-ports", "1000", "-Pn", "-T4", "-oX", "-"]
     if len(targets) == 1:
         args.append(targets[0])
     else:
@@ -925,7 +925,7 @@ def run_wapiti(urls, max_attack_time=15):
         return []
     vulns = []
     # Limit scanning to 1 URL to prevent long loops, and set attack time limit to 15 seconds
-    for url in urls[:10]:
+    for url in urls:
         logger.info("wapiti scanning %s", url)
         tmpdir = tempfile.mkdtemp(prefix="wapiti_")
         out_path = Path(tmpdir) / "report.json"
@@ -1103,7 +1103,7 @@ def run_nuclei(targets, tech_tags=None, http_timeout=5):
                        getattr(settings, "NUCLEI_PATH", None))
     if not exe or not targets:
         return []
-    targets = targets[:50]  # allow more targets since sub-runs are lighter
+    targets = targets[:200]  # Increased from 50 to 200
 
     if tech_tags:
         # Fast vulnerability scanning: use ONLY the asset discovery tags + fast misconfigs
@@ -1373,11 +1373,7 @@ def run_testssl(targets):
                     version = tls.version()
 
             if not cert:
-                results.append({
-                    "host": host, "ssl_grade": "F", "issuer": "", "ip": ip_addr or host,
-                    "rdns": rdns or "", "expiry_date": "", "purchase_date": "",
-                    "cipher_suite": "", "is_trusted": False, "ip_count": ip_count, "dns_count": dns_count,
-                })
+                logger.warning("No certificate found for %s", host)
                 continue
 
             # Dates - format as DD-MM-YYYY for frontend consistency
@@ -1433,30 +1429,11 @@ def run_testssl(targets):
             })
 
         except ssl.SSLError as e:
-            # ip_count/dns_count may not be defined if error occurred early
-            err_ip_count = locals().get("ip_count", 0)
-            err_dns_count = locals().get("dns_count", 0)
-            results.append({
-                "host": host, "ssl_grade": "F", "issuer": "", "ip": ip_addr or host,
-                "rdns": rdns or "", "expiry_date": "", "purchase_date": "",
-                "cipher_suite": f"SSL error: {e}", "is_trusted": False,
-                "ip_count": err_ip_count, "dns_count": err_dns_count,
-            })
+            logger.warning("SSL verification error for %s: %s", host, e)
         except (socket.timeout, ConnectionRefusedError, ConnectionResetError, OSError) as e:
-            results.append({
-                "host": host, "ssl_grade": "F", "issuer": "", "ip": host,
-                "rdns": "", "expiry_date": "", "purchase_date": "",
-                "cipher_suite": f"Connection error: {e}", "is_trusted": False,
-                "ip_count": 0, "dns_count": 0,
-            })
+            logger.warning("Connection error during SSL check for %s: %s", host, e)
         except Exception as e:
             logger.exception("SSL check failed for %s: %s", host, e)
-            results.append({
-                "host": host, "ssl_grade": "F", "issuer": "", "ip": host,
-                "rdns": "", "expiry_date": "", "purchase_date": "",
-                "cipher_suite": f"Error: {e}", "is_trusted": False,
-                "ip_count": 0, "dns_count": 0,
-            })
     return results
 
 
@@ -1551,7 +1528,7 @@ def run_full_scan(scan):
             if u and h.get("status_code") and 200 <= h["status_code"] < 500:
                 live_urls.append(u)
         if not live_urls:
-            live_urls = [f"https://{d}" for d in subdomains[:20]]
+            live_urls = [f"https://{d}" for d in subdomains]
         hostnames = []
         for u in live_urls:
             try:
@@ -1567,9 +1544,9 @@ def run_full_scan(scan):
 
         scan.progress = 30
         scan.save(update_fields=["progress"])
-        logger.info("Phase 3: port scanning targets=%s", all_scan_targets[:50])
+        logger.info("Phase 3: port scanning targets=%s", all_scan_targets)
         try:
-            nmap_results = run_nmap(all_scan_targets[:50])
+            nmap_results = run_nmap(all_scan_targets)
         except Exception as e:
             logger.exception("nmap phase failed: %s", e)
             nmap_results = []
@@ -1594,7 +1571,7 @@ def run_full_scan(scan):
                 saved_ports += 1
         # Track scanned domains even when no open ports were found
         if saved_ports == 0 and all_scan_targets:
-            for dom in all_scan_targets[:50]:
+            for dom in all_scan_targets:
                 PortResult.objects.get_or_create(
                     scan=scan, domain=dom,
                     defaults={"ports": [], "org_id": org_id},
@@ -1622,7 +1599,7 @@ def run_full_scan(scan):
 
         # ── Phase 4: Directory Scanning ──────────────────────────────────────
         try:
-            dirs = run_directory_scan(live_urls[:50])
+            dirs = run_directory_scan(live_urls)
             for dr in dirs:
                 DirectoryResult.objects.get_or_create(
                     scan=scan, url=dr.get("url", ""),
@@ -1683,7 +1660,7 @@ def run_full_scan(scan):
 
         # ── Phase 5: Technology Detection (Wappalyzer + header analysis + WhatCMS) ──────
         from .scanner.whatcms_scanner import run_whatcms
-        whatcms_results = run_whatcms(subdomains[:200])
+        whatcms_results = run_whatcms(subdomains)
         whatcms_tech_map = {}
         for wr in whatcms_results:
             dom = wr.get("domain", "")
@@ -1691,13 +1668,13 @@ def run_full_scan(scan):
                 whatcms_tech_map[dom] = wr.get("technologies", [])
 
         # Fast Node.js Wappalyzer with headless browser disabled
-        wappalyzer_results = run_wappalyzer(subdomains[:200])
+        wappalyzer_results = run_wappalyzer(subdomains)
         wapp_tech_map = {}
         for wr in wappalyzer_results:
             dom = wr.get("domain", "")
             if dom:
                 wapp_tech_map[dom] = [f"{t} [Wappalyzer]" for t in wr.get("technologies", [])]
-        header_techs = run_header_tech_analysis(subdomains[:200], httpx_results)
+        header_techs = run_header_tech_analysis(subdomains, httpx_results)
 
         # Merge all techs per host
         combined_tech_map = {}
@@ -1816,7 +1793,7 @@ def run_full_scan(scan):
             all_techs.update(techs)
         nuclei_tags = techs_to_nuclei_tags(all_techs) if all_techs else None
         logger.info("Phase 7: vulnerability scanning targets=%s techs=%s tags=%s",
-                     live_urls[:50], sorted(all_techs), nuclei_tags)
+                     live_urls, sorted(all_techs), nuclei_tags)
         # Mark basic scan as running — frontend will show loading until scan finishes
         scan.vulnerabilities_done = False
         scan.vuln_scan_phase = "running"
@@ -1883,7 +1860,7 @@ def run_full_scan(scan):
                 for attempt in range(1, 4):
                     try:
                         logger.info("Starting nuclei phase (attempt %d)...", attempt)
-                        nuclei_results = run_nuclei(live_urls[:50], tech_tags=nuclei_tags, http_timeout=15)
+                        nuclei_results = run_nuclei(live_urls, tech_tags=nuclei_tags, http_timeout=15)
                         if nuclei_results:
                             logger.info("Nuclei attempt %d found %d vulnerabilities. Saving and moving on...", attempt, len(nuclei_results))
                             save_interim_vulns(nuclei_results)
@@ -1904,7 +1881,7 @@ def run_full_scan(scan):
                 bg_scan.vuln_scan_phase = "running_wapiti"
                 bg_scan.save(update_fields=["vuln_scan_phase"])
                 try:
-                    wapiti_results = run_wapiti(live_urls[:20], max_attack_time=60)
+                    wapiti_results = run_wapiti(live_urls, max_attack_time=60)
                     if wapiti_results:
                         save_interim_vulns(wapiti_results)
                 except Exception as e:
@@ -1997,8 +1974,8 @@ def run_full_scan(scan):
         # ── Phase 9: Anti-Malware (VirusTotal Audit) ──────────────────────────
         logger.info("Phase 9: VirusTotal check for target=%s", target)
         try:
-            from brand_monitoring.models import BrandMonitorTarget
-            from brand_monitoring.tasks import check_domain_virustotal
+            from brand_monitoring.models import BrandMonitorTarget, SuspiciousDomainReport, ImpersonatingScan
+            from brand_monitoring.tasks import check_domain_virustotal, analyze_suspicious_domain_task, analyze_phishing_domain_task
             
             # Find or create BrandMonitorTarget
             target_obj, created = BrandMonitorTarget.objects.get_or_create(
@@ -2013,6 +1990,67 @@ def run_full_scan(scan):
             
             # Run check synchronously (since we are in background scanner thread anyway)
             check_domain_virustotal(target_id=target_obj.id)
+
+            # Trigger other brand monitoring tasks for this scan
+            import threading
+            
+            try:
+                s_report, _ = SuspiciousDomainReport.objects.get_or_create(
+                    domain=target,
+                    org_id=org_id,
+                    defaults={"status": "pending"}
+                )
+                analyze_suspicious_domain_task.delay(s_report.id)
+            except Exception as e:
+                logger.error(f"Auto-Suspicious scan failed for {target}: {e}")
+                
+            try:
+                def _run_phishing(t_id):
+                    try:
+                        analyze_phishing_domain_task.run(t_id)
+                    except Exception as err:
+                        logger.error(f"Background phishing scan failed for target {t_id}: {err}")
+                threading.Thread(target=_run_phishing, args=(target_obj.id,), daemon=True).start()
+            except Exception as e:
+                logger.error(f"Auto-Phishing scan start failed for {target}: {e}")
+
+            # Trigger Impersonation Scan
+            try:
+                org_name_val = target.split('.')[0].capitalize()
+                try:
+                    from authentication.models import Organization
+                    org = Organization.objects.filter(org_id=org_id).first()
+                    if org and org.name:
+                        org_name_val = org.name.strip()
+                except Exception:
+                    pass
+                    
+                username_val = "".join(e for e in org_name_val if e.isalnum()).lower()
+                if not username_val:
+                    username_val = target.split('.')[0].lower()
+
+                i_scan = ImpersonatingScan.objects.create(
+                    username=username_val,
+                    brand_domain=target,
+                    org_name=org_name_val,
+                    org_id=org_id,
+                    status="pending"
+                )
+                
+                def _run_impersonation(s_id):
+                    try:
+                        from brand_monitoring.impersonation_tasks import run_impersonation_scan
+                        run_impersonation_scan(s_id)
+                    except Exception as err:
+                        logger.error(f"Background impersonation scan failed for scan {s_id}: {err}")
+                        try:
+                            ImpersonatingScan.objects.filter(id=s_id).update(status="failed")
+                        except Exception:
+                            pass
+                threading.Thread(target=_run_impersonation, args=(i_scan.id,), daemon=True).start()
+            except Exception as e:
+                logger.error(f"Auto-Impersonation scan start failed for {target}: {e}")
+
         except Exception as e:
             logger.exception("Anti-malware phase failed: %s", e)
 

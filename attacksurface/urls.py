@@ -30,6 +30,7 @@ from .views import (
     ToolsHealthView,
     ExecutiveDashboardSummaryView,
     ScanReportView,
+    NucleiStateView,
 )
 
 urlpatterns = [
@@ -48,6 +49,7 @@ urlpatterns = [
     path("scan/", ScanTriggerView.as_view(), name="attack-surface-scan-trigger"),
     path("admin-scan/", AdminScanTriggerView.as_view(), name="attack-surface-admin-scan-trigger"),
     path("scan/<int:id>/", ScanStatusView.as_view(), name="attack-surface-scan-status"),
+    path("scan/<int:scan_id>/nuclei-state/", NucleiStateView.as_view(), name="attack-surface-nuclei-state"),
     path("scan/<int:scan_id>/report/", ScanReportView.as_view(), name="attack-surface-scan-report"),
     path("scan-history/", ScanHistoryView.as_view(), name="attack-surface-scan-history"),
     path("tools-health/", ToolsHealthView.as_view(), name="attacksurface-tools-health"),

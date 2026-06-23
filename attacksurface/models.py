@@ -19,7 +19,10 @@ class AttackSurfaceScan(models.Model):
     # Phase completion tracking (each phase flips to True when done)
     subdomains_done = models.BooleanField(default=False)
     # Vulnerability scan sub-phases: "pending" → "basic" (PythonScanner done) → "deep" (Nuclei running) → "complete"
-    vuln_scan_phase = models.CharField(max_length=20, default="pending")
+    vuln_scan_phase = models.CharField(max_length=50, default="pending")
+    # Deep nuclei scan live state (persisted so frontend can poll after restart)
+    nuclei_phase = models.CharField(max_length=255, blank=True, default="")
+    nuclei_found = models.IntegerField(default=0)
     endpoints_done = models.BooleanField(default=False)
     ports_done = models.BooleanField(default=False)
     technologies_done = models.BooleanField(default=False)
