@@ -596,24 +596,37 @@ def run_header_tech_analysis(targets, httpx_results):
 
 # ── Nmap ─────────────────────────────────────────────────────────────────────
 
-def run_nmap(targets):
-    exe = resolve_tool("nmap", "NMAP_PATH",
-                       getattr(settings, "NMAP_PATH", None))
-    if not exe or not targets:
+def run_fast_port_scan(targets):
+    # Uses Naabu (from Nuclei authors) for much faster port scanning that won't hang the system
+    exe = resolve_tool("naabu", "NAABU_PATH", getattr(settings, "NAABU_PATH", None)) or "naabu"
+    if not targets:
         return []
-    targets = targets[:100]  # Increased from 20 to 100 to process more targets without crashing nmap
-    args = [exe, "--top-ports", "1000", "-Pn", "-T4", "-oX", "-"]
-    if len(targets) == 1:
-        args.append(targets[0])
-    else:
-        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
-            f.write("\n".join(targets))
-            infile = f.name
-        args.extend(["-iL", infile])
+    targets = targets[:100]
+    
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
+        f.write("\n".join(targets))
+        infile = f.name
+        
+    args = [exe, "-l", infile, "-p", "top-1000", "-silent", "-c", "50"]
     r = run_cmd(args, timeout=120)
-    if len(targets) > 1:
-        Path(infile).unlink(missing_ok=True)
-    return parse_nmap_xml(r["stdout"])
+    Path(infile).unlink(missing_ok=True)
+    
+    results = {}
+    for line in r["stdout"].splitlines():
+        line = line.strip()
+        if ":" not in line:
+            continue
+        # output is usually host:port
+        host, port = line.rsplit(":", 1)
+        if host not in results:
+            results[host] = {"hostname": host, "ports": []}
+        results[host]["ports"].append({
+            "port": port,
+            "service": "unknown",
+            "product": "",
+            "version": ""
+        })
+    return list(results.values())
 
 
 def parse_nmap_xml(xml_output):
@@ -1546,9 +1559,9 @@ def run_full_scan(scan):
         scan.save(update_fields=["progress"])
         logger.info("Phase 3: port scanning targets=%s", all_scan_targets)
         try:
-            nmap_results = run_nmap(all_scan_targets)
+            nmap_results = run_fast_port_scan(all_scan_targets)
         except Exception as e:
-            logger.exception("nmap phase failed: %s", e)
+            logger.exception("port scanning phase failed: %s", e)
             nmap_results = []
 
         # Save ports
@@ -1784,7 +1797,7 @@ def run_full_scan(scan):
         )
         mark_phase(scan, "email_done", 70)
 
-        # ── Phase 7a: Basic vulnerability scan (PythonScanner, no binary needed) ─
+        # ── Phase 7a: Fast Basic Vulnerability Scan (Inline) ─────────────────────
         scan.progress = 70
         scan.save(update_fields=["progress"])
         # Collect all detected technologies across hosts for targeted scanning
@@ -1792,89 +1805,92 @@ def run_full_scan(scan):
         for host, techs in combined_tech_map.items():
             all_techs.update(techs)
         nuclei_tags = techs_to_nuclei_tags(all_techs) if all_techs else None
-        logger.info("Phase 7: vulnerability scanning targets=%s techs=%s tags=%s",
+        logger.info("Phase 7a: Fast basic vulnerability scanning targets=%s techs=%s tags=%s",
                      live_urls, sorted(all_techs), nuclei_tags)
-        # Mark basic scan as running — frontend will show loading until scan finishes
+        
+        # Helper to save vulns (used by both inline and background)
+        def save_interim_vulns(new_vulns, scan_id):
+            from .models import VulnerabilityResult
+            if not new_vulns:
+                return
+            deduped = deduplicate_vulnerabilities(new_vulns)
+            for nv in deduped:
+                target_url = nv.get("target", "")
+                matched_host = nv.get("host") or nv.get("subdomain") or urlparse(target_url).hostname or target
+                severity = (nv.get("severity") or "info").upper()
+                cve = nv.get("cve", "")
+                cwe = nv.get("cwe", "")
+                finding = nv.get("finding") or nv.get("name", "")
+                description = nv.get("description", "")
+                remediation = nv.get("remediation", "")
+                reference = nv.get("reference", "")
+                template_id = nv.get("template_id", "")
+                source_tool = nv.get("source_tool", "Nuclei")
+                vuln_id = nv.get("vulnerability_id") or (f"CVE-{cve}" if cve else f"NUC-{template_id or 'unknown'}")
+                
+                VulnerabilityResult.objects.get_or_create(
+                    scan_id=scan_id,
+                    vulnerability_id=vuln_id,
+                    subdomain=matched_host,
+                    defaults={
+                        "domain": target,
+                        "severity": severity,
+                        "cve": cve or "-",
+                        "cwe": cwe or "-",
+                        "finding": finding or "-",
+                        "description": description or "-",
+                        "remediation": remediation or "-",
+                        "reference": reference or "-",
+                        "template_id": template_id or "",
+                        "source_tool": source_tool,
+                        "org_id": org_id,
+                    },
+                )
+
+        # Mark vulnerability scan as running, background scan will continue asynchronously
         scan.vulnerabilities_done = False
-        scan.vuln_scan_phase = "running"
-        scan.progress = 70
+        scan.vuln_scan_phase = "running_basic"
+        scan.progress = 75
         scan.save(update_fields=["vulnerabilities_done", "vuln_scan_phase", "progress"])
         
-        # ── Phase 7: Vulnerability scan (Python + Nuclei + Wapiti) ────────────
-        logger.info("Phase 7: Starting dynamic vulnerability background task...")
+        # ── Phase 7b: Deep Vulnerability Scan (Background Thread) ──────────────
+        logger.info("Phase 7b: Starting deep dynamic vulnerability background task...")
 
         def _dynamic_deep_scan():
             import time
-            from urllib.parse import urlparse
-            from .models import VulnerabilityResult, SubdomainResult, AttackSurfaceScan
+            from .models import SubdomainResult, AttackSurfaceScan, VulnerabilityResult
             from .faraday_import import import_vulnerabilities_to_faraday
             
             try:
-                # Reload scan instance
                 bg_scan = AttackSurfaceScan.objects.get(id=scan.id)
-                
-                def save_interim_vulns(new_vulns):
-                    if not new_vulns:
-                        return
-                    deduped = deduplicate_vulnerabilities(new_vulns)
-                    for nv in deduped:
-                        target_url = nv.get("target", "")
-                        matched_host = nv.get("host") or nv.get("subdomain") or urlparse(target_url).hostname or target
-                        severity = (nv.get("severity") or "info").upper()
-                        cve = nv.get("cve", "")
-                        cwe = nv.get("cwe", "")
-                        finding = nv.get("finding") or nv.get("name", "")
-                        description = nv.get("description", "")
-                        remediation = nv.get("remediation", "")
-                        reference = nv.get("reference", "")
-                        template_id = nv.get("template_id", "")
-                        source_tool = nv.get("source_tool", "Nuclei")
-                        vuln_id = nv.get("vulnerability_id") or (f"CVE-{cve}" if cve else f"NUC-{template_id or 'unknown'}")
-                        
-                        VulnerabilityResult.objects.get_or_create(
-                            scan_id=bg_scan.id,
-                            vulnerability_id=vuln_id,
-                            subdomain=matched_host,
-                            defaults={
-                                "domain": target,
-                                "severity": severity,
-                                "cve": cve or "-",
-                                "cwe": cwe or "-",
-                                "finding": finding or "-",
-                                "description": description or "-",
-                                "remediation": remediation or "-",
-                                "reference": reference or "-",
-                                "template_id": template_id or "",
-                                "source_tool": source_tool,
-                                "org_id": org_id,
-                            },
-                        )
 
-                # Phase 7a skipped to prioritize speed
-                
-                # Run Nuclei Vulnerability Scan (Incremental)
-                # Retries up to 3 times ONLY on failure. Stops immediately on first success.
-                bg_scan.vuln_scan_phase = "running_nuclei"
+                # Run fast Nuclei scan in background (timeout=5s, only basic tech tags)
+                try:
+                    logger.info("Starting fast nuclei scan in background...")
+                    fast_tags = ["misconfig", "exposure", "default-login"]
+                    if nuclei_tags:
+                        fast_tags.extend(nuclei_tags)
+                    
+                    fast_results = run_nuclei(live_urls, tech_tags=fast_tags, http_timeout=5)
+                    if fast_results:
+                        save_interim_vulns(fast_results, bg_scan.id)
+                        logger.info("Fast scan found %d vulnerabilities.", len(fast_results))
+                except Exception as e:
+                    logger.exception("Fast nuclei scan failed: %s", e)
+
+                # Move to running deep phase
+                bg_scan.refresh_from_db()
+                bg_scan.vuln_scan_phase = "running_deep"
                 bg_scan.save(update_fields=["vuln_scan_phase"])
-                nuclei_succeeded = False
-                for attempt in range(1, 4):
-                    try:
-                        logger.info("Starting nuclei phase (attempt %d)...", attempt)
-                        nuclei_results = run_nuclei(live_urls, tech_tags=nuclei_tags, http_timeout=15)
-                        if nuclei_results:
-                            logger.info("Nuclei attempt %d found %d vulnerabilities. Saving and moving on...", attempt, len(nuclei_results))
-                            save_interim_vulns(nuclei_results)
-                        else:
-                            logger.info("Nuclei attempt %d returned no results.", attempt)
-                        # Whether results found or not, scan completed — do not retry
-                        nuclei_succeeded = True
-                        break
-                    except Exception as e:
-                        logger.exception("nuclei phase failed on attempt %d: %s", attempt, e)
-                        if attempt < 3:
-                            time.sleep(2)
-                if not nuclei_succeeded:
-                    logger.warning("All nuclei attempts failed — continuing to wapiti phase.")
+                
+                # Run Deep Nuclei Scan (All templates, longer timeouts)
+                logger.info("Starting deep nuclei scan...")
+                try:
+                    # Pass tech_tags=None to trigger NUCLEI_TAG_GROUPS (all categories)
+                    from .deep_nuclei_scan import start_deep_scan_thread
+                    start_deep_scan_thread(bg_scan.id, bg_scan.domain, live_urls)
+                except Exception as e:
+                    logger.exception("Deep nuclei scan thread start failed: %s", e)
 
                 # Run Wapiti scanner
                 bg_scan.refresh_from_db()
@@ -1883,7 +1899,7 @@ def run_full_scan(scan):
                 try:
                     wapiti_results = run_wapiti(live_urls, max_attack_time=60)
                     if wapiti_results:
-                        save_interim_vulns(wapiti_results)
+                        save_interim_vulns(wapiti_results, bg_scan.id)
                 except Exception as e:
                     logger.exception("wapiti phase failed: %s", e)
 

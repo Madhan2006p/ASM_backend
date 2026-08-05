@@ -63,22 +63,57 @@ def query_otx(indicator, indicator_type="domain"):
     return results
 
 def query_misp(indicator):
-    # Simulated MISP Query
-    # In a real environment, this would use PyMISP or requests to a MISP instance.
-    # We will simulate finding an IoC if the indicator contains suspicious patterns or has a bad TLD
+    import os
+    from django.conf import settings
+    misp_url = os.getenv("MISP_URL", getattr(settings, "MISP_URL", ""))
+    misp_key = os.getenv("MISP_API_KEY", getattr(settings, "MISP_API_KEY", ""))
+
     bad_tlds = [".xyz", ".top", ".pw", ".cc", ".club"]
     is_ioc = False
     reasons = []
-    
-    if any(indicator.endswith(tld) for tld in bad_tlds):
-        is_ioc = True
-        reasons.append(f"MISP IoC Match: Indicator has high-risk TLD")
-        
-    if any(kw in indicator.lower() for kw in SUSPICIOUS_KEYWORDS):
-        if '-' in indicator:
-            is_ioc = True
-            reasons.append(f"MISP IoC Match: Indicator matches known phishing patterns")
+
+    if misp_url and misp_key:
+        try:
+            headers = {
+                "Authorization": misp_key,
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "returnFormat": "json",
+                "value": indicator
+            }
+            # Remove trailing slash if present
+            url = f"{misp_url.rstrip('/')}/attributes/restSearch"
             
+            # Allow untrusted certs just in case, but warn
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            
+            r = requests.post(url, headers=headers, json=payload, verify=False, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                attributes = data.get("response", {}).get("Attribute", [])
+                if attributes:
+                    is_ioc = True
+                    event_ids = set([str(attr.get("event_id")) for attr in attributes])
+                    reasons.append(f"MISP Match: Found in {len(attributes)} attribute(s) across Event(s): {', '.join(event_ids)}")
+            else:
+                logger.error(f"MISP query failed with status code: {r.status_code}")
+        except Exception as e:
+            logger.error(f"MISP query exception: {e}")
+            
+    else:
+        # Fallback simulated logic if MISP isn't configured
+        if any(indicator.endswith(tld) for tld in bad_tlds):
+            is_ioc = True
+            reasons.append(f"Simulated MISP Match: Indicator has high-risk TLD")
+            
+        if any(kw in indicator.lower() for kw in SUSPICIOUS_KEYWORDS):
+            if '-' in indicator:
+                is_ioc = True
+                reasons.append(f"Simulated MISP Match: Indicator matches known phishing patterns")
+                
     return {"is_ioc": is_ioc, "events": reasons}
 
 def analyze_asset(asset, asset_type="domain", is_input=False):
@@ -125,7 +160,8 @@ def analyze_asset(asset, asset_type="domain", is_input=False):
         "asset": asset,
         "score": min(100, score),
         "reasons": reasons,
-        "otx_data": otx_data
+        "otx_data": otx_data,
+        "misp_data": misp_data
     }
 
 def run_anti_phishing_scan(scan_id):
@@ -206,6 +242,11 @@ def run_anti_phishing_scan(scan_id):
     # Save OTX stuff to old fields to avoid breaking old UI parts
     scan.alienvault_pulse_count = otx.get("general", {}).get("pulse_info", {}).get("count", 0)
     scan.alienvault_reputation = otx
+    
+    # Save MISP data
+    misp = input_analysis.get("misp_data", {})
+    scan.misp_iocs_found = len(misp.get("events", [])) if misp.get("is_ioc") else 0
+    scan.misp_events = misp.get("events", [])
     
     scan.status = 'completed'
     scan.completed_at = timezone.now()
