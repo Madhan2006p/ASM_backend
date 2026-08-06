@@ -111,18 +111,26 @@ class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        email = request.data.get("email", "")
+        email_or_user = request.data.get("email") or request.data.get("username") or ""
         password = request.data.get("password", "")
-        username = request.data.get("username", "")
 
-        if email:
-            try:
-                user_obj = User.objects.get(email=email)
+        username = email_or_user
+        if email_or_user:
+            user_obj = User.objects.filter(username__iexact=email_or_user).first()
+            if not user_obj:
+                user_obj = User.objects.filter(email__iexact=email_or_user).first()
+            if user_obj:
                 username = user_obj.username
-            except User.DoesNotExist:
+
+        user = authenticate(request=request, username=username, password=password)
+        if not user and username:
+            try:
+                u = User.objects.filter(username__iexact=username).first()
+                if u and u.check_password(password) and u.is_active:
+                    user = u
+            except Exception:
                 pass
 
-        user = authenticate(username=username, password=password)
         if not user:
             return Response(
                 {"error": "Invalid credentials"},

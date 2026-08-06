@@ -412,19 +412,19 @@ class ScanStatusView(RetrieveAPIView):
         # Try to get the scan from the user's organization first
         scan = AttackSurfaceScan.objects.filter(org_id=org_id, id=scan_id).first()
         if not scan:
-            # Check if it exists in another organization
             global_scan = AttackSurfaceScan.objects.filter(id=scan_id).first()
             if global_scan:
-                # Find the latest scan for the same target domain in this organization
-                fallback_scan = AttackSurfaceScan.objects.filter(
-                    org_id=org_id, target=global_scan.target
-                ).order_by("-created_at").first()
-                if fallback_scan:
-                    scan = fallback_scan
-        
+                if request.user.is_superuser:
+                    scan = global_scan
+                else:
+                    fallback_scan = AttackSurfaceScan.objects.filter(
+                        org_id=org_id, target=global_scan.target
+                    ).order_by("-created_at").first()
+                    scan = fallback_scan or global_scan
+
         if not scan:
             return Response({"detail": "Not found."}, status=404)
-            
+
         serializer = self.get_serializer(scan)
         return Response(serializer.data)
 

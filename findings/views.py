@@ -79,84 +79,52 @@ class NucleiScanView(APIView):
 
     def post(self, request):
         target_url = request.data.get("target_url")
-        severity = request.data.get("severity", "critical,high,medium,low,info")
-
         if not target_url or not str(target_url).startswith(("http://", "https://")):
             return Response({"detail": "target_url must start with http:// or https://"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Locate nuclei.exe in integrated_backend/tools
-        base_dir = Path(os.path.abspath(__file__)).parents[1]
-        nuclei_path = str(base_dir / "tools" / "nuclei.exe")
-
-        if not os.path.exists(nuclei_path):
-            # Fallback to system path
-            nuclei_path = shutil.which("nuclei")
-            
-        if not nuclei_path or not os.path.exists(nuclei_path):
-            return Response({"detail": f"Nuclei CLI not found at {nuclei_path}. Install nuclei or provide the path."}, status=status.HTTP_400_BAD_REQUEST)
-
-        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-        output_path = tmp.name
-        tmp.close()
-
-        cmd = [
-            nuclei_path,
-            "-u", str(target_url),
-            "-severity", severity,
-            "-jle", output_path,
-            "-timeout", "3",
-            "-retries", "1",
-            "-rate-limit", "150",
-            "-concurrency", "100",
-            "-duc",
-            "-no-stdin",
-        ]
+        from urllib.parse import urlparse
+        from attacksurface.scanner.vulnerability_scanner import run_python_vuln_scanner
 
         def run_and_stream():
             try:
-                # Clear previous findings
-                Finding.objects.filter(source_tool="Nuclei").delete()
-                yield "[INFO] Cleared previous findings from local database.\n"
+                Finding.objects.filter(source_tool="PythonScanner").delete()
+                yield "[INFO] Starting Python Vulnerability Scanner...\n"
             except Exception as e:
                 yield f"[WARN] Failed to clear previous findings: {e}\n"
 
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-
-            for line in iter(process.stdout.readline, ""):
-                yield line
-
-            process.stdout.close()
-            return_code = process.wait()
-
-            yield f"\n[INFO] Nuclei scan finished with return code {return_code}\n"
-
-            # Parse findings
-            output_file = Path(output_path)
-            if output_file.exists() and output_file.stat().st_size > 0:
-                try:
-                    file_bytes = output_file.read_bytes()
-                    direct_findings = parse_nuclei_json_lines(file_bytes)
-                    for f in direct_findings:
-                        Finding.objects.create(**f)
-                    yield f"[INFO] Saved {len(direct_findings)} findings in database.\n"
-                except Exception as e:
-                    yield f"[ERROR] Failed to save scan output: {e}\n"
-            else:
-                yield "[INFO] No vulnerabilities detected.\n"
+            domain = urlparse(target_url).hostname or target_url
+            httpx_items = [{"url": target_url, "headers": {}, "status_code": 0}]
 
             try:
-                output_file.unlink(missing_ok=True)
-            except Exception:
-                pass
+                vulns = run_python_vuln_scanner(domain, httpx_items)
+                yield f"[INFO] Discovered {len(vulns)} vulnerabilities using Python Vulnerability Engine.\n"
+
+                base_id = 2000000000
+                saved_count = 0
+                for idx, v in enumerate(vulns):
+                    sev = str(v.get("severity") or "info").capitalize()
+                    Finding.objects.create(
+                        defectdojo_finding_id=base_id + idx,
+                        title=v.get("finding") or "Vulnerability Discovered",
+                        severity=sev,
+                        cve=v.get("cve") or "",
+                        cwe=v.get("cwe") or "",
+                        description=v.get("finding") or "",
+                        mitigation="Configure recommended security settings.",
+                        endpoint=v.get("subdomain") or domain,
+                        active=True,
+                        source_tool="PythonScanner",
+                        status="opened",
+                    )
+                    saved_count += 1
+                    yield f"  [+] Saved finding: {v.get('finding')} [{sev}]\n"
+
+                yield f"\n[INFO] Python vulnerability scan complete. {saved_count} findings recorded.\n"
+            except Exception as e:
+                yield f"[ERROR] Python scanner failed: {e}\n"
 
         return StreamingHttpResponse(run_and_stream(), content_type="text/plain")
+
 
 
 class FindingsListView(APIView):
