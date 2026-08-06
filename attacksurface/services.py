@@ -13,6 +13,8 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
+from datetime import datetime, timedelta, timezone
+
 import httpx
 from django.conf import settings
 
@@ -32,8 +34,8 @@ from .models import (
 
 from .faraday_import import import_vulnerabilities_to_faraday
 
-# Cross-module vulnerability deduplication
-from .scanner.vulnerability_scanner import deduplicate_vulnerabilities
+# Cross-module vulnerability deduplication & python scanner
+from .scanner.vulnerability_scanner import deduplicate_vulnerabilities, run_python_vuln_scanner
 
 WAPPALYZER_AVAILABLE = False
 try:
@@ -1582,7 +1584,7 @@ def run_full_scan(scan):
                 source_tool = nv.get("source_tool", "Nuclei")
                 vuln_id = nv.get("vulnerability_id") or (f"CVE-{cve}" if cve else f"NUC-{template_id or 'unknown'}")
                 
-                VulnerabilityResult.objects.get_or_create(
+                vr, created = VulnerabilityResult.objects.get_or_create(
                     scan_id=scan_id,
                     vulnerability_id=vuln_id,
                     subdomain=matched_host,
@@ -1600,6 +1602,25 @@ def run_full_scan(scan):
                         "org_id": org_id,
                     },
                 )
+                if not created:
+                    updated = False
+                    if description and (not vr.description or vr.description == "-"):
+                        vr.description = description
+                        updated = True
+                    if remediation and (not vr.remediation or vr.remediation == "-"):
+                        vr.remediation = remediation
+                        updated = True
+                    if reference and (not vr.reference or vr.reference == "-"):
+                        vr.reference = reference
+                        updated = True
+                    if cve and (not vr.cve or vr.cve == "-"):
+                        vr.cve = cve
+                        updated = True
+                    if cwe and (not vr.cwe or vr.cwe == "-"):
+                        vr.cwe = cwe
+                        updated = True
+                    if updated:
+                        vr.save()
 
         # Run Python vulnerability scanner inline so baseline header disclosures & checks are immediately saved
         try:
@@ -1651,7 +1672,7 @@ def run_full_scan(scan):
                 try:
                     # Pass tech_tags=None to trigger NUCLEI_TAG_GROUPS (all categories)
                     from .deep_nuclei_scan import start_deep_scan_thread
-                    start_deep_scan_thread(bg_scan.id, bg_scan.domain, live_urls)
+                    start_deep_scan_thread(bg_scan.id, bg_scan.target, live_urls)
                 except Exception as e:
                     logger.exception("Deep nuclei scan thread start failed: %s", e)
 

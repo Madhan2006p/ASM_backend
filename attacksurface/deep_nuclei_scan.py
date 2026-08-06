@@ -103,8 +103,10 @@ def _save_vuln(scan, finding, domain):
         severity=str(finding.get("severity") or "info").lower(),
         cve=finding.get("cve") or "",
         cwe=finding.get("cwe") or "",
+        description=finding.get("description") or "",
+        remediation=finding.get("remediation") or "",
+        reference=finding.get("reference") or "",
         source_tool="PythonScanner",
-        raw_json=finding,
     )
     return True
 
