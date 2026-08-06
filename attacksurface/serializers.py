@@ -78,6 +78,13 @@ class DirectoryResultSerializer(serializers.ModelSerializer):
             "content_type",
             "content_details",
             "status",
+            # Content-based classification (computed by the analysis engine)
+            "category",
+            "risk",
+            "access_status",
+            "is_sensitive",
+            "sensitive_matches",
+            "title",
             "directories_created",
             "discovered_date",
             "created",

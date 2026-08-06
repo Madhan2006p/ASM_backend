@@ -10,18 +10,58 @@ Runs Nuclei across ALL template categories in ordered phases.
 
 import json
 import logging
+import os
+import shutil
 import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
-NUCLEI_PATH = "/usr/bin/nuclei"
-TEMPLATE_ROOT = "/home/madhan/nuclei-templates"
+
+def _resolve_nuclei_binary():
+    """Locate the nuclei binary: env var → Django settings → PATH → legacy path."""
+    env_path = os.environ.get("NUCLEI_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    settings_path = getattr(settings, "NUCLEI_PATH", None)
+    if settings_path and os.path.isfile(settings_path):
+        return settings_path
+    which = shutil.which("nuclei")
+    if which:
+        return which
+    legacy = "/usr/bin/nuclei"
+    if os.path.isfile(legacy):
+        return legacy
+    return None
+
+
+def _resolve_template_root():
+    """Locate nuclei templates dir: env var → Django settings → ~/nuclei-templates → legacy path."""
+    env_tpl = os.environ.get("NUCLEI_TEMPLATES_PATH")
+    if env_tpl and os.path.isdir(env_tpl):
+        return env_tpl
+    settings_tpl = getattr(settings, "NUCLEI_TEMPLATES_PATH", None)
+    if settings_tpl and os.path.isdir(settings_tpl):
+        return settings_tpl
+    home_tpl = str(Path.home() / "nuclei-templates")
+    if os.path.isdir(home_tpl):
+        return home_tpl
+    legacy = "/home/madhan/nuclei-templates"
+    if os.path.isdir(legacy):
+        return legacy
+    return None
+
+
+# Resolve at import time so SCAN_PHASES can build real template paths.
+NUCLEI_PATH = _resolve_nuclei_binary() or "/usr/bin/nuclei"
+TEMPLATE_ROOT = _resolve_template_root() or "/home/madhan/nuclei-templates"
 
 # ── Phase definitions ──────────────────────────────────────────────────────────
 # Each phase has: name, template paths, severity filter, rate-limit, est. hours
@@ -157,6 +197,8 @@ def stop_deep_scan(scan_id):
 
 def _save_vuln(scan, finding, domain):
     """Save a single vulnerability to the DB if it hasn't been saved yet."""
+    from .models import VulnerabilityResult
+
     template_id = finding.get("template_id") or finding.get("template-id") or ""
     target = finding.get("target") or finding.get("matched-at") or ""
     name = finding.get("name", "")
@@ -202,11 +244,18 @@ def _run_phase_streaming(scan_id, scan, domain, targets, phase, phase_idx):
     import os
     valid_paths = [p for p in phase["paths"] if os.path.exists(p)]
     if not valid_paths:
-        logger.warning("Phase %s: no valid template paths, skipping.", phase_name)
+        logger.warning("Phase %s: no valid template paths under %s, skipping.",
+                       phase_name, TEMPLATE_ROOT)
+        return 0
+
+    # Re-resolve the binary in case it became available after import time.
+    nuclei_bin = _resolve_nuclei_binary()
+    if not nuclei_bin:
+        logger.error("Nuclei binary not found — cannot run phase '%s'.", phase_name)
         return 0
 
     cmd = [
-        NUCLEI_PATH,
+        nuclei_bin,
         "-j",                          # JSON output, one line per finding
         "-severity", phase["severity"],
         "-rl", str(phase["rl"]),       # rate limit
@@ -301,10 +350,7 @@ def run_deep_nuclei_scan(scan_id, domain, targets):
     Main entry point. Runs all phases sequentially, updating live state.
     Designed to be launched in a background thread.
     """
-    from .models import AttackSurfaceScan, VulnerabilityResult
-
-    # Import here to avoid circular imports at module load time
-    globals()["VulnerabilityResult"] = VulnerabilityResult
+    from .models import AttackSurfaceScan
 
     try:
         scan = AttackSurfaceScan.objects.get(id=scan_id)

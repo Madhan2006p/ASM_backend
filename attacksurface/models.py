@@ -136,6 +136,15 @@ class DirectoryResult(models.Model):
     content_type = models.CharField(max_length=255, blank=True, null=True)
     content_details = models.TextField(blank=True, null=True)
     status = models.IntegerField(blank=True, null=True)
+
+    # Content-based classification (computed by the directory analysis engine)
+    category = models.CharField(max_length=64, blank=True, default="")
+    risk = models.CharField(max_length=16, blank=True, default="")
+    access_status = models.CharField(max_length=32, blank=True, default="")
+    is_sensitive = models.BooleanField(default=False)
+    sensitive_matches = models.JSONField(default=list, blank=True)
+    title = models.CharField(max_length=500, blank=True, default="")
+
     org_id = models.CharField(max_length=50, default="1")
     directories_created = models.DateTimeField(auto_now_add=True)
     created = models.DateTimeField(auto_now_add=True)

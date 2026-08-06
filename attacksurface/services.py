@@ -1611,63 +1611,31 @@ def run_full_scan(scan):
         mark_phase(scan, "ports_done", 45)
 
         # ── Phase 4: Directory Scanning ──────────────────────────────────────
+        # Only real scanner output is stored — no fabricated entries. Each
+        # result carries the content-based classification (category, risk,
+        # access status, sensitivity evidence) computed by the analysis engine.
+        # update_or_create refreshes classification on every rescan.
         try:
             dirs = run_directory_scan(live_urls)
             for dr in dirs:
-                DirectoryResult.objects.get_or_create(
+                DirectoryResult.objects.update_or_create(
                     scan=scan, url=dr.get("url", ""),
                     defaults={
                         "subdomain_name": urlparse(dr.get("url", "")).hostname or "",
                         "status": dr.get("status", 0),
                         "content_type": dr.get("content_type", ""),
-                        "content_details": dr.get("content_length", ""),
+                        "content_details": dr.get("preview", "") or "",
+                        "category": dr.get("category", "") or "",
+                        "risk": dr.get("risk", "") or "",
+                        "access_status": dr.get("access_status", "") or "",
+                        "is_sensitive": bool(dr.get("is_sensitive", False)),
+                        "sensitive_matches": dr.get("sensitive_matches") or [],
+                        "title": dr.get("title", "") or "",
                         "org_id": org_id,
                     },
                 )
         except Exception:
             pass
-
-        # Immediate Directories Fallback / Enrichment
-        dirs_count = DirectoryResult.objects.filter(scan=scan).count()
-        if dirs_count < 20:
-            dirs_data = [
-                {"url": f"https://www.{target}/robots.txt", "status": 200, "ct": "text/plain", "cl": "150"},
-                {"url": f"https://www.{target}/sitemap.xml", "status": 200, "ct": "application/xml", "cl": "1240"},
-                {"url": f"https://www.{target}/admin", "status": 403, "ct": "text/html", "cl": "342"},
-                {"url": f"https://www.{target}/login", "status": 200, "ct": "text/html", "cl": "1850"},
-                {"url": f"https://www.{target}/wp-login.php", "status": 200, "ct": "text/html", "cl": "2100"},
-                {"url": f"https://www.{target}/api/v1/users", "status": 401, "ct": "application/json", "cl": "85"},
-                {"url": f"https://www.{target}/api/v1/auth/login", "status": 200, "ct": "application/json", "cl": "256"},
-                {"url": f"https://www.{target}/api/v1/status", "status": 200, "ct": "application/json", "cl": "120"},
-                {"url": f"https://www.{target}/static/css/main.css", "status": 200, "ct": "text/css", "cl": "8450"},
-                {"url": f"https://www.{target}/static/js/bundle.js", "status": 200, "ct": "application/javascript", "cl": "34200"},
-                {"url": f"https://www.{target}/.env", "status": 403, "ct": "text/plain", "cl": "0"},
-                {"url": f"https://www.{target}/.git/config", "status": 404, "ct": "text/html", "cl": "180"},
-                {"url": f"https://www.{target}/backup.zip", "status": 404, "ct": "text/html", "cl": "220"},
-                {"url": f"https://www.{target}/uploads/images", "status": 403, "ct": "text/html", "cl": "320"},
-                {"url": f"https://www.{target}/assets/favicon.ico", "status": 200, "ct": "image/x-icon", "cl": "1150"},
-                {"url": f"https://www.{target}/dashboard", "status": 302, "ct": "text/html", "cl": "0"},
-                {"url": f"https://www.{target}/config", "status": 403, "ct": "text/html", "cl": "280"},
-                {"url": f"https://www.{target}/public/index.html", "status": 200, "ct": "text/html", "cl": "1450"},
-                {"url": f"https://www.{target}/wp-content/themes", "status": 403, "ct": "text/html", "cl": "310"},
-                {"url": f"https://www.{target}/wp-includes/js", "status": 403, "ct": "text/html", "cl": "415"},
-                {"url": f"https://www.{target}/node_modules", "status": 404, "ct": "text/html", "cl": "150"},
-                {"url": f"https://www.{target}/phpmyadmin", "status": 404, "ct": "text/html", "cl": "285"},
-                {"url": f"https://www.{target}/server-status", "status": 403, "ct": "text/html", "cl": "312"},
-                {"url": f"https://www.{target}/graphql", "status": 405, "ct": "application/json", "cl": "98"},
-                {"url": f"https://www.{target}/.well-known/security.txt", "status": 200, "ct": "text/plain", "cl": "210"},
-            ]
-            for dd in dirs_data:
-                DirectoryResult.objects.get_or_create(
-                    scan=scan, url=dd["url"],
-                    defaults={
-                        "subdomain_name": urlparse(dd["url"]).hostname or f"www.{target}",
-                        "status": dd["status"],
-                        "content_type": dd["ct"],
-                        "content_details": dd["cl"],
-                        "org_id": org_id,
-                    }
-                )
 
         mark_phase(scan, "directories_done", 55)
 
@@ -1846,6 +1814,22 @@ def run_full_scan(scan):
                         "org_id": org_id,
                     },
                 )
+
+        # Run the built-in Python vulnerability scanner (no external binaries).
+        # This guarantees basic findings (missing security headers, server/tech
+        # disclosure, exposed sensitive ports) are always captured even when
+        # nuclei or wapiti are unavailable or blocked.
+        try:
+            port_results_for_vulns = [
+                {"domain": pr.get("hostname") or pr.get("address", ""), "ports": pr.get("ports", [])}
+                for pr in nmap_results
+            ]
+            basic_vulns = run_python_vuln_scanner(target, httpx_results, port_results_for_vulns)
+            if basic_vulns:
+                save_interim_vulns(basic_vulns, scan.id)
+                logger.info("Phase 7a: Python vuln scanner found %d basic findings", len(basic_vulns))
+        except Exception as e:
+            logger.exception("Phase 7a python vuln scanner failed: %s", e)
 
         # Mark vulnerability scan as running, background scan will continue asynchronously
         scan.vulnerabilities_done = False

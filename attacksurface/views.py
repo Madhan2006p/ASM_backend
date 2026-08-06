@@ -154,6 +154,23 @@ class DirectoryListView(AttackSurfaceBaseView):
     model = DirectoryResult
     required_module = "directories"
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = self.request.query_params
+        category = params.get("category")
+        risk = params.get("risk")
+        access_status = params.get("access_status")
+        sensitive = params.get("sensitive")
+        if category:
+            qs = qs.filter(category__iexact=category)
+        if risk:
+            qs = qs.filter(risk__iexact=risk)
+        if access_status:
+            qs = qs.filter(access_status__iexact=access_status)
+        if sensitive in ("true", "1"):
+            qs = qs.filter(is_sensitive=True)
+        return qs
+
 
 class TechnologyListView(AttackSurfaceBaseView):
     serializer_class = TechnologyResultSerializer

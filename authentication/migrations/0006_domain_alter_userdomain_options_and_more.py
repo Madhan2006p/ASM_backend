@@ -76,6 +76,10 @@ class Migration(migrations.Migration):
             migrate_existing_domains,
             reverse_code=migrations.RunPython.noop,
         ),
+        migrations.AlterUniqueTogether(
+            name="userdomain",
+            unique_together=set(),
+        ),
         migrations.RemoveField(
             model_name="userdomain",
             name="domain",
