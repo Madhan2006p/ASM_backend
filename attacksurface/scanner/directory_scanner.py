@@ -33,7 +33,7 @@ COMMON_PATHS = [
 ]
 
 
-def _check_path(client, base_url, path):
+def _check_path(client, base_url, path, root_length=None):
     """Check a single path and return result dict or None."""
     url = base_url.rstrip("/") + path
     try:
@@ -42,6 +42,11 @@ def _check_path(client, base_url, path):
         if status in (200, 201, 204, 301, 302, 303, 307, 308, 401, 403, 405, 500, 501):
             ct = resp.headers.get("content-type", "")
             cl = len(resp.content)
+            
+            # SPA Catch-all Check: If server returns 200 OK with html content length matching root page, it's a SPA fallback, not a real file
+            if status == 200 and root_length and abs(cl - root_length) < 50 and "text/html" in ct.lower():
+                return None
+                
             return {"url": url, "status": status, "content_type": ct, "content_length": cl}
     except Exception:
         pass
@@ -67,8 +72,17 @@ def run_python_directory_scanner(targets, max_workers=10):
         base_url = target.rstrip("/")
         found = 0
         with httpx.Client(headers=bypass_headers, timeout=8, verify=False, follow_redirects=False) as client:
+            # Measure root index content length for SPA catch-all detection
+            root_len = None
+            try:
+                root_resp = client.get(base_url)
+                if root_resp.status_code == 200:
+                    root_len = len(root_resp.content)
+            except Exception:
+                pass
+
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                fut_map = {pool.submit(_check_path, client, base_url, p): p for p in COMMON_PATHS}
+                fut_map = {pool.submit(_check_path, client, base_url, p, root_len): p for p in COMMON_PATHS}
                 for fut in as_completed(fut_map, timeout=60):
                     r = fut.result()
                     if r:
