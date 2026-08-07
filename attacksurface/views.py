@@ -183,6 +183,60 @@ class VulnerabilityListView(AttackSurfaceBaseView):
     model = VulnerabilityResult
     required_module = "vulnerabilities"
 
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        serializer = self.get_serializer(queryset, many=True)
+        data = serializer.data
+        
+        import re
+        grouped = {}
+        for item in data:
+            raw_title = item.get('finding') or item.get('vulnerability_id') or 'Security Vulnerability'
+            template_id = item.get('template_id') or ''
+            vulnerability_id = item.get('vulnerability_id') or ''
+            cve = item.get('cve') or ''
+            asset = item.get('subdomain') or item.get('domain') or 'Target Scope'
+            
+            normalized_title = raw_title
+            if asset and asset != 'Target Scope':
+                pattern = rf'\s+(on|at|for)\s+{re.escape(asset)}\b'
+                normalized_title = re.sub(pattern, '', normalized_title, flags=re.IGNORECASE)
+                normalized_title = re.sub(rf'\b{re.escape(asset)}\b', '', normalized_title, flags=re.IGNORECASE)
+                normalized_title = re.sub(r'\s+', ' ', normalized_title).strip()
+                normalized_title = re.sub(r'^[\:\-\,]\s*', '', normalized_title)
+                normalized_title = re.sub(r'\s*[\:\-\,]$', '', normalized_title)
+            
+            if template_id:
+                key = template_id
+            elif vulnerability_id:
+                key = vulnerability_id
+            elif cve:
+                key = cve
+            else:
+                key = normalized_title.lower()
+            
+            if key not in grouped:
+                item_copy = dict(item)
+                item_copy['finding'] = normalized_title
+                item_copy['affected_assets'] = [asset]
+                grouped[key] = item_copy
+            else:
+                if asset not in grouped[key]['affected_assets']:
+                    grouped[key]['affected_assets'].append(asset)
+                    
+        response_data = list(grouped.values())
+        
+        auth_header = request.headers.get('Authorization', '')
+        token = ''
+        if auth_header.startswith('Bearer '):
+            token = auth_header.split(' ')[1]
+            
+        return Response({
+            'results': response_data,
+            'access_token': token,
+            'token_type': 'Bearer'
+        })
+
 
 class SSLResultListView(AttackSurfaceBaseView):
     serializer_class = SSLResultSerializer
