@@ -243,6 +243,7 @@ class EmailSecurityResult(models.Model):
     mx = models.JSONField(default=list, blank=True)
     dkim_selector1 = models.JSONField(default=list, blank=True)
     dkim_default = models.JSONField(default=list, blank=True)
+    bimi = models.JSONField(default=list, blank=True)
     smtp_hosts = models.JSONField(default=list, blank=True)
     smtp_port_scan = models.JSONField(default=dict, blank=True)
     smtp_open_relay = models.JSONField(default=dict, blank=True)

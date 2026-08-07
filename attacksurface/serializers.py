@@ -159,6 +159,9 @@ class EmailSecurityResultSerializer(serializers.ModelSerializer):
             "spf",
             "dmarc",
             "mx",
+            "dkim_default",
+            "dkim_selector1",
+            "bimi",
             "smtp_starttls",
             "created_at",
         ]
