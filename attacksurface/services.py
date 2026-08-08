@@ -1244,7 +1244,6 @@ def run_full_scan(scan):
             print("Failed to auto-start Spiderfoot scan:", e)
 
         # ── Phase 1: Subdomain Discovery ──────────────────────────────────────
-        is_first_scan = not AttackSurfaceScan.objects.filter(target=target).exclude(id=scan.id).exists()
         current_time = timezone.now()
 
         subdomains = run_subfinder(target)
@@ -1255,16 +1254,12 @@ def run_full_scan(scan):
             previous_subs = SubdomainResult.objects.filter(scan__target=target, domain=sub).exclude(scan=scan).order_by('id')
             
             if not previous_subs.exists():
-                if is_first_scan:
-                    created_val = current_time
-                    updated_val = None
-                else:
-                    created_val = None
-                    updated_val = current_time
+                created_val = current_time
+                updated_val = None
             else:
                 prev_sub = previous_subs.last()
                 created_val = prev_sub.created_date
-                updated_val = prev_sub.updated_date
+                updated_val = current_time
 
             SubdomainResult.objects.get_or_create(
                 scan=scan, domain=sub,
@@ -1285,16 +1280,12 @@ def run_full_scan(scan):
                 previous_subs = SubdomainResult.objects.filter(scan__target=target, domain=fallback_domain).exclude(scan=scan).order_by('id')
                 
                 if not previous_subs.exists():
-                    if is_first_scan:
-                        created_val = current_time
-                        updated_val = None
-                    else:
-                        created_val = None
-                        updated_val = current_time
+                    created_val = current_time
+                    updated_val = None
                 else:
                     prev_sub = previous_subs.last()
                     created_val = prev_sub.created_date
-                    updated_val = prev_sub.updated_date
+                    updated_val = current_time
 
                 SubdomainResult.objects.get_or_create(
                     scan=scan, domain=fallback_domain,
