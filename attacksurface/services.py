@@ -1244,14 +1244,36 @@ def run_full_scan(scan):
             print("Failed to auto-start Spiderfoot scan:", e)
 
         # ── Phase 1: Subdomain Discovery ──────────────────────────────────────
+        is_first_scan = not AttackSurfaceScan.objects.filter(target=target).exclude(id=scan.id).exists()
+        current_time = timezone.now()
+
         subdomains = run_subfinder(target)
         if not subdomains:
             subdomains = [target]
 
         for sub in subdomains:
+            previous_subs = SubdomainResult.objects.filter(scan__target=target, domain=sub).exclude(scan=scan).order_by('id')
+            
+            if not previous_subs.exists():
+                if is_first_scan:
+                    created_val = current_time
+                    updated_val = None
+                else:
+                    created_val = None
+                    updated_val = current_time
+            else:
+                prev_sub = previous_subs.last()
+                created_val = prev_sub.created_date
+                updated_val = prev_sub.updated_date
+
             SubdomainResult.objects.get_or_create(
                 scan=scan, domain=sub,
-                defaults={"org_id": org_id, "status": "Active"},
+                defaults={
+                    "org_id": org_id, 
+                    "status": "Active",
+                    "created_date": created_val,
+                    "updated_date": updated_val
+                },
             )
 
         # Immediate Subdomain Fallback / Enrichment
@@ -1259,9 +1281,29 @@ def run_full_scan(scan):
         if sub_count <= 2:
             fallbacks = ["www", "api", "mail", "admin", "dev", "vpn"]
             for f in fallbacks:
+                fallback_domain = f"{f}.{target}"
+                previous_subs = SubdomainResult.objects.filter(scan__target=target, domain=fallback_domain).exclude(scan=scan).order_by('id')
+                
+                if not previous_subs.exists():
+                    if is_first_scan:
+                        created_val = current_time
+                        updated_val = None
+                    else:
+                        created_val = None
+                        updated_val = current_time
+                else:
+                    prev_sub = previous_subs.last()
+                    created_val = prev_sub.created_date
+                    updated_val = prev_sub.updated_date
+
                 SubdomainResult.objects.get_or_create(
-                    scan=scan, domain=f"{f}.{target}",
-                    defaults={"org_id": org_id, "status": "Active"},
+                    scan=scan, domain=fallback_domain,
+                    defaults={
+                        "org_id": org_id, 
+                        "status": "Active",
+                        "created_date": created_val,
+                        "updated_date": updated_val
+                    },
                 )
             # Re-read subdomains list
             subdomains = [r.domain for r in SubdomainResult.objects.filter(scan=scan)]

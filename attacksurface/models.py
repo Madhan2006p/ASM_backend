@@ -77,6 +77,8 @@ class SubdomainResult(models.Model):
     org_id = models.CharField(max_length=50, default="1")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    created_date = models.DateTimeField(null=True, blank=True)
+    updated_date = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["domain"]

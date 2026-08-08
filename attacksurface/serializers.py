@@ -31,6 +31,8 @@ class SubdomainResultSerializer(serializers.ModelSerializer):
             "cdn",
             "created_at",
             "updated_at",
+            "created_date",
+            "updated_date",
         ]
 
 
