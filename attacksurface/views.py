@@ -340,7 +340,15 @@ class AdminScanTriggerView(APIView):
             try:
                 target_user = User.objects.get(id=user_id)
                 assigned = get_org_allowed_domains(target_user)
-                if target not in assigned:
+                normalized_assigned = set()
+                for d in assigned:
+                    norm = re.sub(r'^https?://', '', str(d).strip().lower())
+                    norm = norm.split('/')[0].split(':')[0]
+                    norm = re.sub(r'^www\.', '', norm)
+                    if norm:
+                        normalized_assigned.add(norm)
+                
+                if target not in normalized_assigned:
                     return Response(
                         {"error": f"Domain '{target}' is not in the user's organization allowed domains. Add it to the organization first."},
                         status=status.HTTP_403_FORBIDDEN,
