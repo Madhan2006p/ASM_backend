@@ -15,6 +15,8 @@ from .models import (
 
 
 class SubdomainResultSerializer(serializers.ModelSerializer):
+    ports = serializers.SerializerMethodField()
+
     class Meta:
         model = SubdomainResult
         fields = [
@@ -27,6 +29,8 @@ class SubdomainResultSerializer(serializers.ModelSerializer):
             "ports",
             "dns_records",
             "vulnerabilities_count",
+            "location",
+            "screenshot_url",
             "waf",
             "cdn",
             "created_at",
@@ -34,6 +38,20 @@ class SubdomainResultSerializer(serializers.ModelSerializer):
             "created_date",
             "updated_date",
         ]
+
+    def get_ports(self, obj):
+        from .models import PortResult
+        port_result = PortResult.objects.filter(scan=obj.scan, domain=obj.domain).first()
+        raw_ports = port_result.ports if (port_result and port_result.ports) else obj.ports
+        
+        formatted_ports = []
+        if isinstance(raw_ports, list):
+            for p in raw_ports:
+                if isinstance(p, dict):
+                    formatted_ports.append(f"{p.get('port', '')}/{p.get('service', 'unknown')}")
+                else:
+                    formatted_ports.append(str(p))
+        return formatted_ports
 
 
 class EndpointResultSerializer(serializers.ModelSerializer):
