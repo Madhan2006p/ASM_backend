@@ -121,7 +121,6 @@ class LoginView(APIView):
                 user_obj = User.objects.filter(email__iexact=email_or_user).first()
             if user_obj:
                 username = user_obj.username
-
         user = authenticate(request=request, username=username, password=password)
         if not user and username:
             try:

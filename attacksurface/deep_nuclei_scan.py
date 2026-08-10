@@ -19,8 +19,48 @@ from django.db import transaction
 from django.utils import timezone
 from .scanner.vulnerability_scanner import run_python_vuln_scanner
 
+import os
+from django.conf import settings
+
 logger = logging.getLogger(__name__)
 
+def _resolve_nuclei_binary():
+    """Locate the nuclei binary: env var → Django settings → PATH → legacy path."""
+    env_path = os.environ.get("NUCLEI_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    settings_path = getattr(settings, "NUCLEI_PATH", None)
+    if settings_path and os.path.isfile(settings_path):
+        return settings_path
+    which = shutil.which("nuclei")
+    if which:
+        return which
+    legacy = "/usr/bin/nuclei"
+    if os.path.isfile(legacy):
+        return legacy
+    return None
+
+
+def _resolve_template_root():
+    """Locate nuclei templates dir: env var → Django settings → ~/nuclei-templates → legacy path."""
+    env_tpl = os.environ.get("NUCLEI_TEMPLATES_PATH")
+    if env_tpl and os.path.isdir(env_tpl):
+        return env_tpl
+    settings_tpl = getattr(settings, "NUCLEI_TEMPLATES_PATH", None)
+    if settings_tpl and os.path.isdir(settings_tpl):
+        return settings_tpl
+    home_tpl = str(Path.home() / "nuclei-templates")
+    if os.path.isdir(home_tpl):
+        return home_tpl
+    legacy = "/home/madhan/nuclei-templates"
+    if os.path.isdir(legacy):
+        return legacy
+    return None
+
+
+# Resolve at import time so SCAN_PHASES can build real template paths.
+NUCLEI_PATH = _resolve_nuclei_binary() or "/usr/bin/nuclei"
+TEMPLATE_ROOT = _resolve_template_root() or "/home/madhan/nuclei-templates"
 # ── Phase definitions ──────────────────────────────────────────────────────────
 SCAN_PHASES = [
     {

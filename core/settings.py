@@ -42,7 +42,6 @@ INSTALLED_APPS = [
     'brand_monitoring',
     'mobile_vapt',
     'findings',
-    'owasp_scanner',
 ]
 
 MIDDLEWARE = [
@@ -136,10 +135,10 @@ REST_FRAMEWORK = {
 
 # ─── JWT ──────────────────────────────────────────────────────────────────────
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=30),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=180),
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=1),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'ROTATE_REFRESH_TOKENS': True,
-    'BLACKLIST_AFTER_ROTATION': False,
+    'BLACKLIST_AFTER_ROTATION': True,
 }
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
@@ -151,20 +150,49 @@ CORS_ALLOW_HEADERS = list(default_headers) + [
 ]
 
 # ─── Cache ────────────────────────────────────────────────────────────────────
-CACHES = {
-    'default': {
-        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-        'LOCATION': os.getenv('REDIS_URL', 'redis://localhost:6379/1'),
-        'OPTIONS': {
-            'MAX_ENTRIES': 1000,
+import socket
+def is_redis_running(url):
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        host = parsed.hostname or 'localhost'
+        port = parsed.port or 6379
+        s = socket.create_connection((host, port), timeout=0.5)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+if is_redis_running(redis_url):
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': f"{redis_url}/1",
+            'OPTIONS': {
+                'MAX_ENTRIES': 1000,
+            },
         },
-    },
-    'tools': {
-        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-        'LOCATION': os.getenv('REDIS_URL', 'redis://localhost:6379/2'),
-        'TIMEOUT': 86400,
-    },
-}
+        'tools': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': f"{redis_url}/2",
+            'TIMEOUT': 86400,
+        },
+    }
+else:
+    print("\n[!] Redis server is not running on localhost:6379.")
+    print("[!] Falling back to LocMemCache (local memory cache) for robust operation without Redis.\n")
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'unique-snowflake-1',
+        },
+        'tools': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'unique-snowflake-2',
+            'TIMEOUT': 86400,
+        },
+    }
 
 # ─── Celery ───────────────────────────────────────────────────────────────────
 CELERY_BROKER_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')

@@ -162,7 +162,7 @@ def resolve_tool(tool_name, env_var, candidates=None):
     env_path = os.environ.get(env_var)
     if env_path and Path(env_path).exists():
         return env_path
-    path = os.popen(f"which {tool_name} 2>/dev/null").read().strip()
+    path = shutil.which(tool_name)
     if path:
         return path
     if isinstance(candidates, str):
@@ -178,7 +178,7 @@ def run_cmd(cmd, timeout=120, input_data=None, env=None):
     start = time.monotonic()
     try:
         r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, input=input_data,
+            cmd, capture_output=True, text=True, errors='replace', timeout=timeout, input=input_data,
             env=env,
         )
         elapsed = round(time.monotonic() - start, 3)
@@ -609,7 +609,7 @@ def run_fast_port_scan(targets):
         f.write("\n".join(targets))
         infile = f.name
         
-    args = [exe, "-l", infile, "-p", "top-1000", "-silent", "-c", "50"]
+    args = [exe, "-l", infile, "-tp", "1000", "-silent", "-c", "50"]
     r = run_cmd(args, timeout=120)
     Path(infile).unlink(missing_ok=True)
     
@@ -944,6 +944,9 @@ def run_wapiti(urls, max_attack_time=15):
     return run_python_vuln_scanner(target_host, httpx_items)
 
 
+
+
+
 def run_nuclei(targets, tech_tags=None, http_timeout=5):
     """Run Python vulnerability scanner on given targets (replacing external Nuclei)."""
     if not targets:
@@ -966,6 +969,9 @@ def run_email_security(domain):
         "dkim_default": [],
         "dkim_selector1": [],
         "bimi": [],
+        "smtp_hosts": [],
+        "smtp_port_scan": {},
+        "smtp_open_relay": {},
         # smtp_starttls has three meaningful states:
         #   {"checked": False, ...}          → verification was not attempted / checkdmarc failed
         #   {"checked": True, "supported": False} → checked, but no MX host advertised STARTTLS
@@ -1244,31 +1250,14 @@ def run_full_scan(scan):
             print("Failed to auto-start Spiderfoot scan:", e)
 
         # ── Phase 1: Subdomain Discovery ──────────────────────────────────────
-        current_time = timezone.now()
-
         subdomains = run_subfinder(target)
         if not subdomains:
             subdomains = [target]
 
         for sub in subdomains:
-            previous_subs = SubdomainResult.objects.filter(scan__target=target, domain=sub).exclude(scan=scan).order_by('id')
-            
-            if not previous_subs.exists():
-                created_val = current_time
-                updated_val = None
-            else:
-                prev_sub = previous_subs.last()
-                created_val = prev_sub.created_date
-                updated_val = current_time
-
             SubdomainResult.objects.get_or_create(
                 scan=scan, domain=sub,
-                defaults={
-                    "org_id": org_id, 
-                    "status": "Active",
-                    "created_date": created_val,
-                    "updated_date": updated_val
-                },
+                defaults={"org_id": org_id, "status": "Active"},
             )
 
         # Immediate Subdomain Fallback / Enrichment
@@ -1276,25 +1265,9 @@ def run_full_scan(scan):
         if sub_count <= 2:
             fallbacks = ["www", "api", "mail", "admin", "dev", "vpn"]
             for f in fallbacks:
-                fallback_domain = f"{f}.{target}"
-                previous_subs = SubdomainResult.objects.filter(scan__target=target, domain=fallback_domain).exclude(scan=scan).order_by('id')
-                
-                if not previous_subs.exists():
-                    created_val = current_time
-                    updated_val = None
-                else:
-                    prev_sub = previous_subs.last()
-                    created_val = prev_sub.created_date
-                    updated_val = current_time
-
                 SubdomainResult.objects.get_or_create(
-                    scan=scan, domain=fallback_domain,
-                    defaults={
-                        "org_id": org_id, 
-                        "status": "Active",
-                        "created_date": created_val,
-                        "updated_date": updated_val
-                    },
+                    scan=scan, domain=f"{f}.{target}",
+                    defaults={"org_id": org_id, "status": "Active"},
                 )
             # Re-read subdomains list
             subdomains = [r.domain for r in SubdomainResult.objects.filter(scan=scan)]
@@ -1701,6 +1674,36 @@ def run_full_scan(scan):
                         save_interim_vulns(wapiti_results, bg_scan.id)
                 except Exception as e:
                     logger.exception("wapiti phase failed: %s", e)
+
+                # Run Arjun parameter fuzzer
+                bg_scan.refresh_from_db()
+                bg_scan.vuln_scan_phase = "running_arjun"
+                bg_scan.save(update_fields=["vuln_scan_phase"])
+                try:
+                    from reconnaissance.services.arjun_scanner import run_arjun as arjun_runner
+                    from urllib.parse import urlparse
+                    for url in live_urls[:3]:  # Scan up to 3 live subdomains to avoid long wait
+                        arjun_res = arjun_runner(url)
+                        if arjun_res and "parsed_output" in arjun_res:
+                            params = arjun_res["parsed_output"].get("parameters", [])
+                            arjun_findings = []
+                            for p in params:
+                                arjun_findings.append({
+                                    "target": url,
+                                    "host": urlparse(url).hostname or url,
+                                    "severity": "INFO",
+                                    "cve": "-",
+                                    "cwe": "-",
+                                    "finding": f"HTTP Parameter: {p}",
+                                    "description": f"HTTP parameter '{p}' discovered via Arjun parameter fuzzing on {url}.",
+                                    "remediation": "Verify input validation is enforced for this parameter.",
+                                    "source_tool": "Arjun",
+                                    "vulnerability_id": f"ARJ-{p}"
+                                })
+                            if arjun_findings:
+                                save_interim_vulns(arjun_findings, bg_scan.id)
+                except Exception as e:
+                    logger.exception("arjun phase failed: %s", e)
 
                 # Update Subdomain vulnerability counts
                 vuln_count_map = {}

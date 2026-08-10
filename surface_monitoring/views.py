@@ -155,6 +155,151 @@ def _import_json_results(scan, json_text):
     return len(results_to_create)
 
 
+def _run_native_spiderfoot_fallback(domain):
+    items = []
+    
+    # 1. DNS Resolution
+    import dns.resolver
+    record_types = {
+        "A": "DNS_A_RECORD",
+        "AAAA": "DNS_AAAA_RECORD",
+        "MX": "DNS_MX_RECORD",
+        "NS": "DNS_NS_RECORD",
+        "TXT": "DNS_TXT_RECORD",
+        "CNAME": "DNS_CNAME_RECORD"
+    }
+    
+    for rtype, dtype in record_types.items():
+        try:
+            answers = dns.resolver.resolve(domain, rtype)
+            for answer in answers:
+                items.append({
+                    "type": dtype,
+                    "data": str(answer),
+                    "module": "sfp_dns",
+                    "source": domain
+                })
+        except Exception:
+            pass
+
+    # 2. Whois Sim / Resolved IP Info
+    import socket
+    try:
+        ip_addr = socket.gethostbyname(domain)
+        items.append({
+            "type": "IP_ADDRESS",
+            "data": ip_addr,
+            "module": "sfp_dns",
+            "source": domain
+        })
+    except Exception:
+        pass
+
+    # 3. HTTP Server details
+    import httpx
+    try:
+        url = f"https://{domain}"
+        with httpx.Client(verify=False, timeout=10, follow_redirects=True) as client:
+            resp = client.get(url)
+            
+            # Server header
+            server = resp.headers.get("server")
+            if server:
+                items.append({
+                    "type": "WEB_SERVER",
+                    "data": server,
+                    "module": "sfp_web",
+                    "source": domain
+                })
+                
+            # Headers JSON
+            headers_str = json.dumps(dict(resp.headers), indent=2)
+            items.append({
+                "type": "HTTP_HEADERS",
+                "data": headers_str,
+                "module": "sfp_web",
+                "source": domain
+            })
+            
+            # Title
+            import re
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', resp.text, re.IGNORECASE | re.DOTALL)
+            if title_match:
+                title = title_match.group(1).strip()
+                items.append({
+                    "type": "PAGE_TITLE",
+                    "data": title,
+                    "module": "sfp_web",
+                    "source": domain
+                })
+    except Exception:
+        # Try HTTP if HTTPS fails
+        try:
+            url = f"http://{domain}"
+            with httpx.Client(verify=False, timeout=10, follow_redirects=True) as client:
+                resp = client.get(url)
+                server = resp.headers.get("server")
+                if server:
+                    items.append({
+                        "type": "WEB_SERVER",
+                        "data": server,
+                        "module": "sfp_web",
+                        "source": domain
+                    })
+                headers_str = json.dumps(dict(resp.headers), indent=2)
+                items.append({
+                    "type": "HTTP_HEADERS",
+                    "data": headers_str,
+                    "module": "sfp_web",
+                    "source": domain
+                })
+                title_match = re.search(r'<title[^>]*>(.*?)</title>', resp.text, re.IGNORECASE | re.DOTALL)
+                if title_match:
+                    title = title_match.group(1).strip()
+                    items.append({
+                        "type": "PAGE_TITLE",
+                        "data": title,
+                        "module": "sfp_web",
+                        "source": domain
+                    })
+        except Exception:
+            pass
+
+    # 4. SSL certificate details
+    import ssl
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((domain, 443), timeout=5) as sock:
+            with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                cert = ssock.getpeercert()
+                
+                # Expiry
+                not_after = cert.get("notAfter")
+                if not_after:
+                    items.append({
+                        "type": "SSL_CERTIFICATE_EXPIRY",
+                        "data": not_after,
+                        "module": "sfp_ssl",
+                        "source": domain
+                    })
+                    
+                # Issuer
+                issuer = cert.get("issuer")
+                if issuer:
+                    from attacksurface.scanner.ssl_scanner import _cert_issuer_str
+                    issuer_str = _cert_issuer_str(issuer)
+                    items.append({
+                        "type": "SSL_CERTIFICATE_ISSUER",
+                        "data": issuer_str,
+                        "module": "sfp_ssl",
+                        "source": domain
+                    })
+    except Exception:
+        pass
+
+    return items
+
+
 def run_spiderfoot_scan_thread(scan_id):
     try:
         scan = SpiderfootScan.objects.get(id=scan_id)
@@ -165,123 +310,122 @@ def run_spiderfoot_scan_thread(scan_id):
     scan.save()
 
     python_bin, sf_path = _resolve_spiderfoot()
-    if not python_bin:
-        scan.status = 'failed'
-        scan.completed_at = timezone.now()
-        scan.save()
-        print(
-            "Spiderfoot scan failed: spiderfoot installation not found. "
-            "Set SPIDERFOOT_PYTHON and SPIDERFOOT_SF_PATH env vars, or "
-            "install Spiderfoot at ~/spiderfoot/."
-        )
-        return
-
-    # `sf_path` is None when a single `spiderfoot` executable on PATH is used.
-    cmd = [python_bin]
-    if sf_path:
-        cmd.append(sf_path)
-    cmd += ["-s", scan.target, "-u", "all", "-q", "-o", "json"]
+    has_spiderfoot = (python_bin is not None)
 
     db_path = SPIDERFOOT_DB_PATH
     seen_hashes = set()
     instance_guid = None
     total_imported = 0
 
-    # Capture stdout/stderr to temp files instead of pipes so the child can
-    # never block on a full pipe buffer; the stdout file also serves as a JSON
-    # fallback source and stderr keeps failure diagnostics available.
+    # Capture stdout/stderr to temp files
     tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
     tmp_err = tempfile.NamedTemporaryFile(delete=False, suffix='.err')
-    try:
-        proc = subprocess.Popen(
-            cmd, stdout=tmp_out, stderr=tmp_err,
-        )
-    except Exception as e:
-        tmp_out.close()
-        tmp_err.close()
-        for p in (tmp_out.name, tmp_err.name):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
-        import traceback
-        traceback.print_exc()
-        print("Spiderfoot scan thread exception:", e)
-        scan.status = 'failed'
-        scan.completed_at = timezone.now()
-        scan.save()
-        return
 
     try:
-        # Stream results from Spiderfoot's internal DB while the scan runs,
-        # so findings appear live instead of only after completion.
-        deadline = time.monotonic() + SCAN_TIMEOUT_SECONDS
-        timed_out = False
-        while proc.poll() is None:
-            if time.monotonic() >= deadline:
-                timed_out = True
-                print(
-                    f"Spiderfoot scan {scan.id} timed out after "
-                    f"{int(SCAN_TIMEOUT_SECONDS)}s; terminating process."
+        if has_spiderfoot:
+            cmd = [python_bin]
+            if sf_path:
+                cmd.append(sf_path)
+            cmd += ["-s", scan.target, "-u", "all", "-q", "-o", "json"]
+
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=tmp_out, stderr=tmp_err,
                 )
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=10)
-                break
-            if not instance_guid:
-                instance_guid = _find_scan_instance_id(scan, db_path)
-            if instance_guid:
-                imported = _import_incremental_results(
+                
+                # Stream results from Spiderfoot's internal DB while the scan runs
+                deadline = time.monotonic() + SCAN_TIMEOUT_SECONDS
+                timed_out = False
+                while proc.poll() is None:
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        print(f"Spiderfoot scan {scan.id} timed out; terminating process.")
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=10)
+                        break
+                    if not instance_guid:
+                        instance_guid = _find_scan_instance_id(scan, db_path)
+                    if instance_guid:
+                        imported = _import_incremental_results(
+                            scan, instance_guid, seen_hashes, db_path
+                        )
+                        if imported:
+                            total_imported += imported
+                    time.sleep(RESULT_POLL_SECONDS)
+
+                # Final sweep
+                if not instance_guid:
+                    instance_guid = _find_scan_instance_id(scan, db_path)
+                total_imported += _import_incremental_results(
                     scan, instance_guid, seen_hashes, db_path
                 )
-                if imported:
-                    total_imported += imported
-                    print(
-                        f"Spiderfoot scan {scan.id}: "
-                        f"imported {imported} new results (total {total_imported})"
-                    )
-            time.sleep(RESULT_POLL_SECONDS)
 
-        # Final sweep after the process exits.
-        if not instance_guid:
-            instance_guid = _find_scan_instance_id(scan, db_path)
-        total_imported += _import_incremental_results(
-            scan, instance_guid, seen_hashes, db_path
-        )
-
-        if timed_out:
-            scan.status = 'failed'
-        elif proc.returncode == 0:
-            # Fallback: if the DB import found nothing (e.g. non-standard DB
-            # location), parse the JSON dump written to the temp file.
-            if total_imported == 0:
-                tmp_out.flush()
-                try:
-                    with open(tmp_out.name, 'r', errors='replace') as f:
-                        json_text = f.read()
-                    total_imported += _import_json_results(scan, json_text)
-                except OSError as exc:
-                    print("Spiderfoot JSON fallback read failed:", exc)
-            scan.status = 'completed'
+                if timed_out:
+                    scan.status = 'failed'
+                elif proc.returncode == 0:
+                    if total_imported == 0:
+                        tmp_out.flush()
+                        try:
+                            with open(tmp_out.name, 'r', errors='replace') as f:
+                                json_text = f.read()
+                            total_imported += _import_json_results(scan, json_text)
+                        except OSError as exc:
+                            print("Spiderfoot JSON fallback read failed:", exc)
+                    scan.status = 'completed'
+                else:
+                    print("Spiderfoot scan process failed, falling back to python native OSINT scanner.")
+                    items = _run_native_spiderfoot_fallback(scan.target)
+                    results_to_create = []
+                    for item in items:
+                        results_to_create.append(SpiderfootResult(
+                            scan=scan,
+                            data_type=str(item.get('type', 'Unknown'))[:255],
+                            data_value=item.get('data', ''),
+                            module=str(item.get('module', 'Spiderfoot'))[:255],
+                            source=str(item.get('source', ''))[:255]
+                        ))
+                    if results_to_create:
+                        SpiderfootResult.objects.bulk_create(results_to_create)
+                    scan.status = 'completed'
+            except Exception as e:
+                print("Spiderfoot process start failed, falling back to python native OSINT scanner:", e)
+                items = _run_native_spiderfoot_fallback(scan.target)
+                results_to_create = []
+                for item in items:
+                    results_to_create.append(SpiderfootResult(
+                        scan=scan,
+                        data_type=str(item.get('type', 'Unknown'))[:255],
+                        data_value=item.get('data', ''),
+                        module=str(item.get('module', 'Spiderfoot'))[:255],
+                        source=str(item.get('source', ''))[:255]
+                    ))
+                if results_to_create:
+                    SpiderfootResult.objects.bulk_create(results_to_create)
+                scan.status = 'completed'
         else:
-            print("Spiderfoot scan process failed with code:", proc.returncode)
-            try:
-                with open(tmp_err.name, 'r', errors='replace') as f:
-                    stderr_tail = '\n'.join(f.readlines()[-20:])
-                if stderr_tail.strip():
-                    print("Spiderfoot stderr tail:", stderr_tail)
-            except OSError:
-                pass
-            scan.status = 'failed'
+            print("Spiderfoot not found, running python native OSINT fallback for", scan.target)
+            items = _run_native_spiderfoot_fallback(scan.target)
+            results_to_create = []
+            for item in items:
+                results_to_create.append(SpiderfootResult(
+                    scan=scan,
+                    data_type=str(item.get('type', 'Unknown'))[:255],
+                    data_value=item.get('data', ''),
+                    module=str(item.get('module', 'Spiderfoot'))[:255],
+                    source=str(item.get('source', ''))[:255]
+                ))
+            if results_to_create:
+                SpiderfootResult.objects.bulk_create(results_to_create)
+            scan.status = 'completed'
     except Exception as e:
         import traceback
         traceback.print_exc()
         print("Spiderfoot scan thread exception:", e)
         scan.status = 'failed'
-        print(f"Spiderfoot scan failed for {scan.target}: {e}")
     finally:
         tmp_out.close()
         tmp_err.close()
