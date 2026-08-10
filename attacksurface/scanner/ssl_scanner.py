@@ -3,6 +3,9 @@ import ssl
 import socket
 import struct
 import logging
+import subprocess
+import shutil
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
@@ -27,7 +30,65 @@ WEAK_CIPHER_PATTERNS = {
 }
 
 
-def _check_heartbleed(host, port=443, timeout=4):
+def run_nmap_ssl_enum_ciphers(host, ports="0-65535", timeout=20):
+    """
+    Executes 'nmap -Pn --script ssl-enum-ciphers -p 0-65535 <host>' to enumerate SSL/TLS ciphers,
+    supported protocols, ratings, and weak ciphers.
+    """
+    nmap_path = shutil.which("nmap")
+    if not nmap_path:
+        logger.warning("nmap binary not found on system path.")
+        return None
+
+    cmd = [nmap_path, "-Pn", "--script", "ssl-enum-ciphers", "-p", str(ports), "-oX", "-", host]
+    logger.info("Executing nmap command: %s", " ".join(cmd))
+    
+    nmap_data = {
+        "supported_protocols": [],
+        "ciphers": [],
+        "weak_ciphers": [],
+        "vulnerabilities": [],
+        "ssl_grade": None,
+        "raw_output": ""
+    }
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        nmap_data["raw_output"] = proc.stdout
+        
+        if proc.stdout:
+            try:
+                root = ET.fromstring(proc.stdout)
+                for script in root.findall(".//script[@id='ssl-enum-ciphers']"):
+                    for table in script.findall("table"):
+                        proto_key = table.get("key", "")
+                        if proto_key and proto_key not in nmap_data["supported_protocols"]:
+                            nmap_data["supported_protocols"].append(proto_key)
+                        
+                        for elem in table.findall(".//table"):
+                            cipher_name = elem.get("key", "")
+                            if cipher_name:
+                                nmap_data["ciphers"].append(f"{cipher_name} ({proto_key})")
+                                cipher_upper = cipher_name.upper()
+                                for pat in WEAK_CIPHER_PATTERNS:
+                                    if pat in cipher_upper:
+                                        nmap_data["weak_ciphers"].append(f"{cipher_name} [{pat}]")
+
+                    for elem in script.findall(".//elem[@key='least strength']"):
+                        nmap_data["ssl_grade"] = elem.text
+                        break
+            except Exception as parse_err:
+                logger.warning("Error parsing nmap XML output for %s: %s", host, parse_err)
+    except subprocess.TimeoutExpired:
+        logger.warning("nmap ssl-enum-ciphers command timed out after %ds for %s", timeout, host)
+    except Exception as e:
+        logger.exception("Error running nmap command for %s: %s", host, e)
+
+    return nmap_data
+
+
+
+def _check_heartbleed(host, port=443, timeout=1.5):
     """Active TLS Heartbeat extension probe to test for OpenSSL Heartbleed (CVE-2014-0160)."""
     payload = bytearray.fromhex(
         "16030100dc010000d8030153435b909d9b720b00c9906586e2b40d"
@@ -190,6 +251,18 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
     except Exception:
         pass
 
+    # Run nmap --script ssl-enum-ciphers -p 0-65535 <host>
+    nmap_info = run_nmap_ssl_enum_ciphers(host, ports="0-65535", timeout=15)
+    if nmap_info:
+        if nmap_info.get("supported_protocols"):
+            results["supported_protocols"].extend(nmap_info["supported_protocols"])
+        if nmap_info.get("ciphers"):
+            results["ciphers"].extend(nmap_info["ciphers"])
+        if nmap_info.get("weak_ciphers"):
+            results["weak_ciphers"].extend(nmap_info["weak_ciphers"])
+        if nmap_info.get("ssl_grade"):
+            results["ssl_grade"] = nmap_info["ssl_grade"]
+
     # Protocol version probes
     protocols_to_test = [
         ("TLSv1.3", getattr(ssl, "TLSVersion", None) and getattr(ssl.TLSVersion, "TLSv1_3", None)),
@@ -290,7 +363,7 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "cwe": "CWE-326",
             "finding": f"Deprecated TLS 1.0 protocol enabled on {host}:{port}",
             "template_id": "ssl/deprecated-tls10",
-            "source_tool": "PythonScanner",
+            "source_tool": "Nmap (ssl-enum-ciphers)",
             "description": "TLS 1.0 is deprecated (RFC 8996) and vulnerable to BEAST attacks.",
             "remediation": "Disable TLS 1.0 and enforce TLS 1.2 or TLS 1.3."
         })
@@ -306,9 +379,104 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "cwe": "CWE-326",
             "finding": f"Deprecated TLS 1.1 protocol enabled on {host}:{port}",
             "template_id": "ssl/deprecated-tls11",
-            "source_tool": "PythonScanner",
+            "source_tool": "Nmap (ssl-enum-ciphers)",
             "description": "TLS 1.1 is deprecated (RFC 8996).",
             "remediation": "Disable TLS 1.1 and enforce TLS 1.2 or TLS 1.3."
+        })
+
+    # ── 1. POODLE (CVE-2014-3566 & CVE-2014-8730) ─────────────────────────────────
+    has_sslv3 = "SSLv3" in results["supported_protocols"] or "SSLv3.0" in results["supported_protocols"]
+    has_tls10 = any(p in results["supported_protocols"] for p in ["TLSv1.0", "TLSv1"])
+    has_tls11 = "TLSv1.1" in results["supported_protocols"]
+    has_cbc = any("CBC" in c.upper() for c in results["ciphers"])
+
+    if has_sslv3:
+        grade_penalty += 45
+        results["vulnerabilities"].append({
+            "vulnerability_id": "SSL-POODLE-SSLV3",
+            "domain": host,
+            "subdomain": host,
+            "severity": "HIGH",
+            "cve": "CVE-2014-3566",
+            "cwe": "CWE-310",
+            "finding": f"POODLE SSLv3 Padding Oracle Vulnerability (CVE-2014-3566) on {host}:{port}",
+            "template_id": "ssl/poodle-sslv3",
+            "source_tool": "SSL/TLS Cipher Audit",
+            "configuration_trigger": "SSL 3.0 protocol supported with CBC cipher suites",
+            "description": "The server supports SSL 3.0, enabling POODLE (Padding Oracle On Downgraded Legacy Encryption) attacks. Attackers can decrypt secret session cookies and HTTPS payload data.",
+            "remediation": "Disable SSL 3.0 support entirely on web servers, load balancers, and reverse proxies."
+        })
+    elif (has_tls10 or has_tls11) and has_cbc:
+        results["vulnerabilities"].append({
+            "vulnerability_id": "SSL-POODLE-TLS",
+            "domain": host,
+            "subdomain": host,
+            "severity": "MEDIUM",
+            "cve": "CVE-2014-8730",
+            "cwe": "CWE-310",
+            "finding": f"POODLE TLS CBC Variant Potential Vulnerability (CVE-2014-8730) on {host}:{port}",
+            "template_id": "ssl/poodle-tls",
+            "source_tool": "SSL/TLS Cipher Audit",
+            "configuration_trigger": f"Legacy TLS ({'TLS 1.0' if has_tls10 else 'TLS 1.1'}) enabled with CBC mode ciphers",
+            "description": "The server supports legacy TLS versions with CBC-mode cipher suites. Improper MAC padding check implementations can allow POODLE-style decryption attacks over TLS.",
+            "remediation": "Disable TLS 1.0/1.1 and enforce TLS 1.2 or TLS 1.3 with AEAD cipher suites (AES-GCM / CHACHA20)."
+        })
+
+    # ── 2. SWEET32 (CVE-2016-2183 / CVE-2016-6329) ────────────────────────────────
+    has_64bit_block_cipher = any(
+        kw in c.upper() for c in results["ciphers"] for kw in ["3DES", "DES-CBC3", "TRIPLEDES", "BLOWFISH", "CAST5", "IDEA"]
+    )
+    if has_64bit_block_cipher:
+        grade_penalty += 20
+        results["vulnerabilities"].append({
+            "vulnerability_id": "SSL-SWEET32-3DES",
+            "domain": host,
+            "subdomain": host,
+            "severity": "MEDIUM",
+            "cve": "CVE-2016-2183",
+            "cwe": "CWE-326",
+            "finding": f"SWEET32 Birthday Attack 64-bit Block Cipher (CVE-2016-2183) on {host}:{port}",
+            "template_id": "ssl/sweet32-3des",
+            "source_tool": "SSL/TLS Cipher Audit",
+            "configuration_trigger": "64-bit block size cipher suite enabled (3DES / Triple-DES / DES-CBC3)",
+            "description": "The server supports 64-bit block size ciphers (such as 3DES), which are vulnerable to SWEET32 birthday collision attacks after processing large volumes of HTTPS requests on a single connection.",
+            "remediation": "Disable 3DES and DES-CBC3 cipher suites in web server configuration and enforce 128-bit or 256-bit AES / ChaCha20 ciphers."
+        })
+
+    # ── 3. BEAST (CVE-2011-3389) ──────────────────────────────────────────────────
+    if has_tls10 and has_cbc:
+        grade_penalty += 25
+        results["vulnerabilities"].append({
+            "vulnerability_id": "SSL-BEAST-VULNERABILITY",
+            "domain": host,
+            "subdomain": host,
+            "severity": "MEDIUM",
+            "cve": "CVE-2011-3389",
+            "cwe": "CWE-326",
+            "finding": f"BEAST Vulnerability (CVE-2011-3389) via TLS 1.0 CBC Ciphers on {host}:{port}",
+            "template_id": "ssl/beast-attack",
+            "source_tool": "SSL/TLS Cipher Audit",
+            "configuration_trigger": "TLS 1.0 protocol enabled with CBC-mode cipher suites",
+            "description": "TLS 1.0 combined with Cipher Block Chaining (CBC) mode ciphers allows Man-in-the-Middle attackers to decrypt encrypted HTTPS communication via initialization vector prediction (BEAST attack).",
+            "remediation": "Disable TLS 1.0 protocol support and enforce TLS 1.2 or TLS 1.3."
+        })
+
+    # ── 4. LUCKY13 (CVE-2013-0169) ────────────────────────────────────────────────
+    has_legacy_tls = any(p in results["supported_protocols"] for p in ["TLSv1.0", "TLSv1", "TLSv1.1", "TLSv1.2"])
+    if has_legacy_tls and has_cbc:
+        results["vulnerabilities"].append({
+            "vulnerability_id": "SSL-LUCKY13-VULNERABILITY",
+            "domain": host,
+            "subdomain": host,
+            "severity": "MEDIUM",
+            "cve": "CVE-2013-0169",
+            "cwe": "CWE-208",
+            "finding": f"LUCKY13 TLS CBC Timing Side-Channel Vulnerability (CVE-2013-0169) on {host}:{port}",
+            "template_id": "ssl/lucky13-timing",
+            "source_tool": "SSL/TLS Cipher Audit",
+            "configuration_trigger": "Legacy TLS (1.0/1.1/1.2) supported with MAC-then-Encrypt CBC cipher suites",
+            "description": "The server supports CBC-mode cipher suites with standard MAC-then-Encrypt construction, making it vulnerable to timing side-channel analysis (LUCKY13 attack) to recover plaintext bytes.",
+            "remediation": "Prefer AEAD ciphers (e.g. AES-GCM, CHACHA20-POLY1305) and disable CBC mode cipher suites or enable Encrypt-then-MAC extension."
         })
 
     # Check OpenSSL Heartbleed Vulnerability

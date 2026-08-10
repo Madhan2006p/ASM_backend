@@ -18,6 +18,100 @@ logger = logging.getLogger(__name__)
 mobsf = MobSFClient()
 
 
+def _start_mobsf_scan(scan_id):
+    """
+    Kick off a background thread that runs the full MobSF pipeline for a scan:
+    ensure MobSF container is up -> upload binary -> start scan -> store report.
+    Reused by both the API upload view and the Django admin save flow.
+    """
+    import threading
+
+    def run_scan_thread():
+        from django.db import connection
+        try:
+            from mobile_vapt.models import MobileScan
+            try:
+                scan = MobileScan.objects.get(pk=scan_id)
+            except MobileScan.DoesNotExist:
+                return
+            file_path = scan.file_path
+            if not file_path or not os.path.exists(file_path):
+                logger.error(f"[MobSF] Scan {scan_id} has no valid file at {file_path}.")
+                scan.status = 'upload_failed'
+                scan.save()
+                return
+
+            # Ensure MobSF is running before we try to upload to it
+            from mobile_vapt.docker_manager import ensure_mobsf_running
+            ensure_mobsf_running()
+
+            mobsf_result = mobsf.upload_file(file_path)
+            if mobsf_result and 'hash' in mobsf_result:
+                # Delete any pre-existing scan with the same hash to prevent UNIQUE constraint violation.
+                # Guard against a concurrent scan of the same binary racing on the same hash.
+                from django.db import transaction
+                try:
+                    with transaction.atomic():
+                        MobileScan.objects.filter(scan_hash=mobsf_result['hash']).exclude(pk=scan.id).delete()
+                        scan.scan_hash = mobsf_result['hash']
+                        scan.status = 'uploaded_to_mobsf'
+                        scan.save()
+                except Exception as hash_err:
+                    logger.warning(f"[MobSF] Hash conflict while saving scan {scan.id}: {hash_err}")
+                    # Re-query and reuse the existing row instead of crashing the thread
+                    existing = MobileScan.objects.filter(scan_hash=mobsf_result['hash']).exclude(pk=scan.id).first()
+                    if existing:
+                        scan.delete()
+                        scan = existing
+                    else:
+                        scan.status = 'upload_failed'
+                        scan.save()
+                        return
+
+                scan_result = mobsf.start_scan(scan.scan_hash, scan_type=scan.source)
+                if scan_result:
+                    scan.status = 'scanning'
+                    scan.save()
+
+                    # MobSF start_scan returns full analysis data synchronously.
+                    # Use it directly as the report; fall back to get_report_json if needed.
+                    report = scan_result if scan_result.get('app_name') else mobsf.get_report_json(scan.scan_hash)
+                    if report and report.get('app_name'):
+                        scan.status = 'completed'
+                        scan.app_name = report.get('app_name', '')
+                        scan.package_name = report.get('package_name', '')
+                        scan.version_name = report.get('version_name', '')
+                        avg_score = report.get('average_cvss', 0)
+                        scan.score = str(100 - int(avg_score * 10) if avg_score else 50)
+                        scan.save()
+                        FileUploadView._store_findings(scan, report)
+                        FileUploadView._store_permissions(scan, report)
+                        FileUploadView._store_scores(scan, report)
+                    else:
+                        scan.status = 'report_failed'
+                        scan.save()
+                else:
+                    scan.status = 'scan_failed'
+                    scan.save()
+            else:
+                scan.status = 'upload_failed'
+                scan.save()
+        except Exception as e:
+            logger.error(f"Error in background scan thread: {e}", exc_info=True)
+            try:
+                scan = MobileScan.objects.get(pk=scan_id)
+                scan.status = 'scan_failed'
+                scan.save()
+            except Exception:
+                pass
+        finally:
+            # NOTE: intentionally NOT stopping MobSF here — the container is left
+            # running so subsequent scans (and concurrent ones) keep working.
+            connection.close()
+
+    threading.Thread(target=run_scan_thread).start()
+
+
 class FileUploadView(APIView):
     parser_classes = [MultiPartParser, FormParser]
 
@@ -58,74 +152,13 @@ class FileUploadView(APIView):
         scan.save()
 
         # Start background scan thread to avoid blocking and timing out
-        import threading
-
-        def run_scan_thread():
-            from django.db import connection
-            try:
-                # Ensure MobSF is running before we try to upload to it
-                from mobile_vapt.docker_manager import ensure_mobsf_running
-                ensure_mobsf_running()
-
-                mobsf_result = mobsf.upload_file(file_path)
-                if mobsf_result and 'hash' in mobsf_result:
-                    # Delete any pre-existing scan with the same hash to prevent UNIQUE constraint violation
-                    MobileScan.objects.filter(scan_hash=mobsf_result['hash']).exclude(pk=scan.id).delete()
-
-                    scan.scan_hash = mobsf_result['hash']
-                    scan.status = 'uploaded_to_mobsf'
-                    scan.save()
-
-                    scan_result = mobsf.start_scan(scan.scan_hash, scan_type=scan.source)
-                    if scan_result:
-                        scan.status = 'scanning'
-                        scan.save()
-
-                        # MobSF start_scan returns full analysis data synchronously.
-                        # Use it directly as the report; fall back to get_report_json if needed.
-                        report = scan_result if scan_result.get('app_name') else mobsf.get_report_json(scan.scan_hash)
-                        if report and report.get('app_name'):
-                            scan.status = 'completed'
-                            scan.app_name = report.get('app_name', '')
-                            scan.package_name = report.get('package_name', '')
-                            scan.version_name = report.get('version_name', '')
-                            avg_score = report.get('average_cvss', 0)
-                            scan.score = str(100 - int(avg_score * 10) if avg_score else 50)
-                            scan.save()
-                            self._store_findings(scan, report)
-                            self._store_permissions(scan, report)
-                            self._store_scores(scan, report)
-                        else:
-                            scan.status = 'report_failed'
-                            scan.save()
-                    else:
-                        scan.status = 'scan_failed'
-                        scan.save()
-                else:
-                    scan.status = 'upload_failed'
-                    scan.save()
-            except Exception as e:
-                logger.error(f"Error in background scan thread: {e}", exc_info=True)
-                try:
-                    scan.status = 'scan_failed'
-                    scan.save()
-                except Exception:
-                    pass
-            finally:
-                # Stop the MobSF Docker container now that scanning is done
-                try:
-                    from mobile_vapt.docker_manager import stop_mobsf
-                    stop_mobsf()
-                except Exception as stop_err:
-                    logger.warning(f"Could not stop MobSF container: {stop_err}")
-                connection.close()
-
-        threading.Thread(target=run_scan_thread).start()
+        _start_mobsf_scan(scan.id)
 
         serializer = MobileScanSerializer(scan)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-    def _store_findings(self, scan, report):
+    @staticmethod
+    def _store_findings(scan, report):
         """
         Parse MobSF v4.5 report and store all real vulnerability findings.
         Covers: appsec, code_analysis, manifest_findings, certificate_findings,
@@ -278,7 +311,8 @@ class FileUploadView(APIView):
                 file_path=file_str[:500],
             )
 
-    def _store_permissions(self, scan, report):
+    @staticmethod
+    def _store_permissions(scan, report):
         """
         Parse MobSF v4.5 permissions.
         Structure: report['permissions'] = {permission_name: {status, info, description}, ...}
@@ -306,7 +340,8 @@ class FileUploadView(APIView):
                 elif isinstance(perm, str):
                     MobilePermission.objects.create(scan=scan, permission_name=perm)
 
-    def _store_scores(self, scan, report):
+    @staticmethod
+    def _store_scores(scan, report):
         avg_score = report.get('average_cvss', 0)
         SecurityScore.objects.create(
             scan=scan,

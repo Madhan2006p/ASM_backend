@@ -111,25 +111,18 @@ class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        email_or_user = request.data.get("email") or request.data.get("username") or ""
+        email = request.data.get("email", "")
         password = request.data.get("password", "")
+        username = request.data.get("username", "")
 
-        username = email_or_user
-        if email_or_user:
-            user_obj = User.objects.filter(username__iexact=email_or_user).first()
-            if not user_obj:
-                user_obj = User.objects.filter(email__iexact=email_or_user).first()
-            if user_obj:
-                username = user_obj.username
-        user = authenticate(request=request, username=username, password=password)
-        if not user and username:
+        if email:
             try:
-                u = User.objects.filter(username__iexact=username).first()
-                if u and u.check_password(password) and u.is_active:
-                    user = u
-            except Exception:
-                pass
+                user_obj = User.objects.get(email=email)
+                username = user_obj.username
+            except User.DoesNotExist:
+                username = email
 
+        user = authenticate(username=username, password=password)
         if not user:
             return Response(
                 {"error": "Invalid credentials"},
@@ -194,7 +187,7 @@ class CheckAuthView(APIView):
         return Response({"authenticated": True, "user": get_user_data(request.user, request)})
 
 
-# ─── Organization Management Views ────────────────────────────────────────────
+# ΓöÇΓöÇΓöÇ Organization Management Views ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 class OrganizationListView(APIView):
     """List organizations for the current user and create new ones."""
@@ -381,7 +374,7 @@ class OrganizationMembersView(APIView):
         return Response({"message": "Member removed successfully"})
 
 
-# ─── Feature Management API ────────────────────────────────────────────────
+# ΓöÇΓöÇΓöÇ Feature Management API ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 # All available features with their IDs, names, and module keys
 AVAILABLE_FEATURES = [
@@ -512,7 +505,7 @@ class UserFeatureManagementView(APIView):
         })
 
 
-# ─── Admin: Create User Accounts Directly ──────────────────────────────────
+# ΓöÇΓöÇΓöÇ Admin: Create User Accounts Directly ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 class AdminCreateUserView(APIView):
     """
@@ -545,7 +538,7 @@ class AdminCreateUserView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # Validate org_id — the admin must be admin of this org OR be superuser
+        # Validate org_id ΓÇö the admin must be admin of this org OR be superuser
         if request.user.is_superuser:
             try:
                 org = Organization.objects.get(org_id=org_id)
