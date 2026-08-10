@@ -1185,3 +1185,164 @@ class VulnMapFindingTests(SimpleTestCase):
         VR.objects.filter.assert_called_once_with(
             scan=scan, source_tool="OWASP Top 10"
         )
+
+
+class A06ProductCVETests(SimpleTestCase):
+    """A06 product fingerprinting: Product/Version → CPE range → matching CVEs.
+
+    Locks in the curated knowledge-base path that turns disclosed component
+    versions (nginx 1.18.0, jQuery 3.4.1, ...) into real CVE findings, while
+    keeping configuration-type issues (no version) CVE-less.
+    """
+
+    # ── version-range helpers ──
+    def test_version_in_range_bounds(self):
+        from owasp_scanner.detectors.a06_outdated_components import _version_in_range
+
+        # open min, inclusive max 1.20.0
+        self.assertTrue(_version_in_range("1.18.0", None, False, "1.20.0", True))
+        self.assertTrue(_version_in_range("1.20.0", None, False, "1.20.0", True))
+        self.assertFalse(_version_in_range("1.20.1", None, False, "1.20.0", True))
+        # exclusive max
+        self.assertTrue(_version_in_range("1.13.6", "0.5.6", True, "1.13.6", True))
+        self.assertFalse(_version_in_range("1.13.7", "0.5.6", True, "1.13.6", True))
+        # no version → no match
+        self.assertFalse(_version_in_range("", None, False, "1.20.0", True))
+
+    def test_version_in_range_zero_padding(self):
+        # A max bound of 7.3 must cover every 7.3.x release (7.3 == 7.3.0)
+        from owasp_scanner.detectors.a06_outdated_components import _version_in_range
+        self.assertTrue(_version_in_range("7.3.0", "5.0.0", True, "7.3.10", True))
+        self.assertTrue(_version_in_range("7.3.5", "5.0.0", True, "7.3.10", True))
+        self.assertTrue(_version_in_range("7.3.10", "5.0.0", True, "7.3.10", True))
+        self.assertFalse(_version_in_range("7.3.11", "5.0.0", True, "7.3.10", True))
+        # PHP 8.x line is covered for CVE-2024-4577 (max 8.3.7)
+        self.assertTrue(_version_in_range("8.2.4", "5.0.0", True, "8.3.7", True))
+        self.assertFalse(_version_in_range("8.3.8", "5.0.0", True, "8.3.7", True))
+
+    def test_lookup_product_cves_nginx_1180(self):
+        from owasp_scanner.detectors.a06_outdated_components import _lookup_product_cves
+
+        cves = _lookup_product_cves("Nginx", "1.18.0")
+        ids = {c["cve"] for c in cves}
+        # 1.18.0 falls inside the CVE-2021-23017 range (<= 1.20.0) only
+        self.assertEqual(ids, {"CVE-2021-23017"})
+        self.assertEqual(cves[0]["cvss"], 7.7)
+
+    def test_lookup_product_cves_apache_2449(self):
+        from owasp_scanner.detectors.a06_outdated_components import _lookup_product_cves
+
+        ids = {c["cve"] for c in _lookup_product_cves("apache http server", "2.4.49")}
+        self.assertIn("CVE-2021-41773", ids)
+        self.assertIn("CVE-2021-42013", ids)
+
+    def test_lookup_product_cves_patched_version_empty(self):
+        from owasp_scanner.detectors.a06_outdated_components import _lookup_product_cves
+
+        # nginx 1.21.0 is past every range → no CVE
+        self.assertEqual(_lookup_product_cves("nginx", "1.21.0"), [])
+        # unknown product → no CVE
+        self.assertEqual(_lookup_product_cves("custom-app", "1.0.0"), [])
+        # CDN/WAF products are never flagged
+        self.assertEqual(_lookup_product_cves("Cloudflare", "1.0.0"), [])
+
+    def test_lookup_product_cves_jquery(self):
+        from owasp_scanner.detectors.a06_outdated_components import _lookup_product_cves
+
+        ids = {c["cve"] for c in _lookup_product_cves("jquery", "3.4.1")}
+        self.assertEqual(ids, {"CVE-2020-11022"})  # 3.4.1 > 3.3.99 → not CVE-2019-11358
+
+    def test_lookup_product_cves_php_patch_versions(self):
+        # PHP 7.3.5 / 8.2.4 are vulnerable; 7.3.11 / 8.3.8 are patched
+        from owasp_scanner.detectors.a06_outdated_components import _lookup_product_cves
+        self.assertIn("CVE-2019-11043", {c["cve"] for c in _lookup_product_cves("php", "7.3.5")})
+        self.assertIn("CVE-2024-4577", {c["cve"] for c in _lookup_product_cves("php", "8.2.4")})
+        self.assertNotIn("CVE-2019-11043", {c["cve"] for c in _lookup_product_cves("php", "7.3.11")})
+        self.assertNotIn("CVE-2024-4577", {c["cve"] for c in _lookup_product_cves("php", "8.3.8")})
+
+    # ── fingerprinting ──
+    def test_fingerprint_server_header(self):
+        from owasp_scanner.detectors.a06_outdated_components import _fingerprint_headers
+
+        out = _fingerprint_headers({"server": "nginx/1.18.0"})
+        self.assertIn(("Nginx", "1.18.0", "Web Server"), out)
+
+    def test_fingerprint_server_header_no_version(self):
+        from owasp_scanner.detectors.a06_outdated_components import _fingerprint_headers
+
+        out = _fingerprint_headers({"server": "Apache/2"})
+        self.assertEqual(out, [("Apache HTTP Server", "", "Web Server")])
+
+    def test_fingerprint_body_jquery_script(self):
+        from owasp_scanner.detectors.a06_outdated_components import _fingerprint_body
+
+        html = '<html><head><script src="/static/jquery-3.4.1.min.js"></script></head></html>'
+        out = _fingerprint_body(html)
+        self.assertIn(("jquery", "3.4.1"), out)
+
+    def test_fingerprint_body_meta_generator_wordpress(self):
+        from owasp_scanner.detectors.a06_outdated_components import _fingerprint_body
+
+        html = '<meta name="generator" content="WordPress 5.2.3" />'
+        out = _fingerprint_body(html)
+        self.assertIn(("wordpress", "5.2.3"), out)
+
+    def test_fingerprint_body_react_dom(self):
+        from owasp_scanner.detectors.a06_outdated_components import _fingerprint_body
+
+        html = '<script crossorigin src="https://unpkg.com/react-dom@17.0.2/umd/react-dom.production.min.js"></script>'
+        out = _fingerprint_body(html)
+        self.assertIn(("react", "17.0.2"), out)
+
+    # ── end-to-end detect_a06 ──
+    def test_detect_a06_creates_cve_finding(self):
+        from owasp_scanner.detectors.a06_outdated_components import detect_a06
+
+        class FakeResp:
+            headers = {"server": "nginx/1.18.0", "content-type": "text/html"}
+            text = "<html><body>hi</body></html>"
+
+        class FakeHttp:
+            def get(self, url, timeout=8):
+                return FakeResp()
+
+        findings = detect_a06("example.com", "example.com",
+                              ["https://example.com/"], FakeHttp())
+        cve_findings = [f for f in findings if f["cve"]]
+        self.assertEqual(len(cve_findings), 1)
+        f = cve_findings[0]
+        self.assertEqual(f["cve"], "CVE-2021-23017")
+        self.assertEqual(f["vulnerability_id"], "A06-CVE202123017")
+        self.assertEqual(f["severity"], "HIGH")
+        self.assertEqual(f["confidence"], 0.9)
+        self.assertEqual(f["status"], "confirmed")
+        self.assertIn("Nginx 1.18.0", f["evidence"])
+        self.assertEqual(f["owasp_rank"], 6)
+
+    def test_detect_a06_informational_when_no_version(self):
+        from owasp_scanner.detectors.a06_outdated_components import detect_a06
+
+        class FakeResp:
+            headers = {"server": "Apache/2", "content-type": "text/html"}
+            text = ""
+
+        class FakeHttp:
+            def get(self, url, timeout=8):
+                return FakeResp()
+
+        findings = detect_a06("example.com", "example.com",
+                              ["https://example.com/"], FakeHttp())
+        ids = {f["vulnerability_id"] for f in findings}
+        self.assertIn("A06-COMPONENT-DETECTED", ids)
+        self.assertFalse(any(f["cve"] for f in findings))
+
+    def test_detect_a06_skip_when_network_error(self):
+        from owasp_scanner.detectors.a06_outdated_components import detect_a06
+
+        class FakeHttp:
+            def get(self, url, timeout=8):
+                raise Exception("connection refused")
+
+        findings = detect_a06("example.com", "example.com",
+                              ["https://example.com/"], FakeHttp())
+        self.assertEqual(findings, [])

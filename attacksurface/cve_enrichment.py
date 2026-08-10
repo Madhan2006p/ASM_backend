@@ -45,8 +45,8 @@ NVD_HEADERS = {"User-Agent": "ASM-CVE-Enrichment/1.0"}
 
 # Without an API key NVD allows ~5 requests / 30 s → 6.5 s spacing is safe.
 DEFAULT_REQUEST_INTERVAL = 6.5
-DEFAULT_MAX_COMPONENTS = 6  # per scan
-MAX_CVES_PER_COMPONENT = 8
+DEFAULT_MAX_COMPONENTS = 12  # per scan
+MAX_CVES_PER_COMPONENT = 15
 
 # Tech names that are pure infrastructure/CDN and have no real "version → CVE"
 # story worth the NVD rate budget. Server headers frequently expose them.
@@ -129,8 +129,10 @@ def parse_tech_entry(entry):
         # only treat the right side as a version when it looks like one
         if right and re.match(r"^\d+(\.\d+)*", right):
             name = left.strip().lower()
-            # strip a possible "v" prefix like v1.2.3
+            # strip a possible "v" prefix like v1.2.3 and any trailing
+            # parenthetical / label suffix (e.g. "1.18.0 (Ubuntu)" -> "1.18.0")
             version = re.sub(r"^v", "", right, flags=re.IGNORECASE)
+            version = re.split(r"\s+\(|\)|\s", version)[0]
             return name, version
 
     # "Name ... 1.2.3" trailing-version form
