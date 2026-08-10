@@ -415,17 +415,69 @@ class OWASPScanner:
         logger.info("Detection complete. Total findings: %d", len(self.all_findings))
 
     async def _run_detector(self, detector) -> List[Finding]:
-        """Run a single detector and return its findings."""
+        """Run a single detector, return its findings, and immediately save to DB for Just-In-Time UI streaming."""
         try:
+            cat_name = getattr(detector, 'owasp_category', 'Detection')
+            await self.progress.update(f"Auditing Category {cat_name}: {detector.name}", self.progress.progress_percent)
             results = await asyncio.wait_for(detector.detect(self.all_assets), timeout=25.0)
             logger.info("Detector %s: %d findings", detector.name, len(results))
+            if results:
+                await self._save_findings_realtime(results)
             return results
         except asyncio.TimeoutError:
             logger.warning("Detector %s timed out after 25s. Returning partial findings.", detector.name)
-            return getattr(detector, '_findings', [])
+            partial = getattr(detector, '_findings', [])
+            if partial:
+                await self._save_findings_realtime(partial)
+            return partial
         except Exception as e:
             logger.error("Detector %s failed: %s", detector.__class__.__name__, e)
             return []
+
+    async def _save_findings_realtime(self, findings_list: List[Finding]) -> None:
+        """Save newly discovered findings to Django DB immediately (Just-In-Time)."""
+        if not self.session_id or not findings_list:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._sync_save_findings, findings_list)
+        except Exception as e:
+            logger.error("Realtime DB save error: %s", e)
+
+    def _sync_save_findings(self, findings_list: List[Finding]) -> None:
+        """Synchronously persist findings to Django DB during live scan."""
+        try:
+            import django
+            from .models import OWASPScanSession, OWASPFinding
+            session = OWASPScanSession.objects.get(id=self.session_id)
+            for f in findings_list:
+                OWASPFinding.objects.get_or_create(
+                    session=session,
+                    fingerprint=f.fingerprint,
+                    defaults={
+                        'title': f.name,
+                        'owasp_category': f.owasp_category,
+                        'owasp_name': f.owasp_name,
+                        'severity': f.severity,
+                        'cvss_score': f.cvss_score,
+                        'cwe_id': f.cwe_id,
+                        'description': f.description,
+                        'remediation': f.remediation,
+                        'affected_url': f.url,
+                        'evidence': f.evidence,
+                    }
+                )
+            # Update session findings count
+            all_findings = session.findings.all()
+            session.total_findings = all_findings.count()
+            session.critical_count = all_findings.filter(severity='CRITICAL').count()
+            session.high_count = all_findings.filter(severity='HIGH').count()
+            session.medium_count = all_findings.filter(severity='MEDIUM').count()
+            session.low_count = all_findings.filter(severity='LOW').count()
+            session.info_count = all_findings.filter(severity='INFO').count()
+            session.save()
+        except Exception as e:
+            logger.error("Sync realtime save findings error: %s", e)
 
     def _get_active_detectors(self) -> List:
         """Return list of detector classes to run based on categories config."""
