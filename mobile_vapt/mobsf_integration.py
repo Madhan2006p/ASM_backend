@@ -20,7 +20,7 @@ class MobSFClient:
             file_name = os.path.basename(file_path)  # Fix: works correctly on Windows
             with open(file_path, 'rb') as f:
                 files = {'file': (file_name, f, 'application/octet-stream')}
-                response = requests.post(url, files=files, headers=self.headers)
+                response = requests.post(url, files=files, headers=self.headers, timeout=(10, 300))
                 response.raise_for_status()
                 return response.json()
         except requests.exceptions.RequestException as e:
@@ -34,7 +34,10 @@ class MobSFClient:
         mobsf_type = type_map.get(scan_type, scan_type)
         data = {'hash': scan_hash, 'scan_type': mobsf_type}
         try:
-            response = requests.post(url, data=data, headers=self.headers)
+            # /api/v1/scan is synchronous: it blocks until the full static analysis
+            # finishes and then returns JSON. Large APKs can take 20+ minutes, so
+            # allow a very generous read timeout to avoid spurious failures.
+            response = requests.post(url, data=data, headers=self.headers, timeout=(10, 3600))
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -45,7 +48,7 @@ class MobSFClient:
         url = f"{self.base_url}/api/v1/report_json"
         data = {'hash': scan_hash}
         try:
-            response = requests.post(url, data=data, headers=self.headers)
+            response = requests.post(url, data=data, headers=self.headers, timeout=(10, 300))
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -56,7 +59,7 @@ class MobSFClient:
         url = f"{self.base_url}/api/v1/download_pdf"
         data = {'hash': scan_hash}
         try:
-            response = requests.post(url, data=data, headers=self.headers)
+            response = requests.post(url, data=data, headers=self.headers, timeout=(10, 300))
             response.raise_for_status()
             return response.content
         except requests.exceptions.RequestException as e:
@@ -64,10 +67,12 @@ class MobSFClient:
             return None
 
     def check_health(self):
-        # MobSF does not have /api/v1/health - check root page availability instead
+        # MobSF does not have /api/v1/health - check root page availability instead.
+        # The root URL redirects (302) to the login page, so treat any 2xx/3xx
+        # response as healthy; anything else (or a connection failure) is not.
         url = f"{self.base_url}/"
         try:
             response = requests.get(url, headers=self.headers, timeout=5)
-            return response.status_code == 200
+            return 200 <= response.status_code < 400
         except requests.exceptions.RequestException:
             return False
