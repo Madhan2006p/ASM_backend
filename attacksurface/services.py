@@ -1216,6 +1216,7 @@ def mark_phase(scan, phase_field, progress):
 def run_full_scan(scan):
     target = scan.target
     org_id = scan.org_id
+    all_scan_targets = [target]
     try:
         scan.status = "running"
         scan.progress = 2
