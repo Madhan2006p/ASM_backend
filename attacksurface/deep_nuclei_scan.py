@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 # ── Phase definitions ──────────────────────────────────────────────────────────
 SCAN_PHASES = [
     {
+        "id": "owasp_top10",
+        "name": "OWASP Top 10 Assessment",
+        "est_hours": 0.15,
+    },
+    {
         "id": "exposures",
         "name": "Exposed Files & Sensitive Endpoints",
         "est_hours": 0.1,
@@ -52,6 +57,11 @@ SCAN_PHASES = [
         "id": "exposed_ports",
         "name": "Sensitive Network Ports & Services",
         "est_hours": 0.1,
+    },
+    {
+        "id": "cve_enrichment",
+        "name": "NVD CVE Correlation",
+        "est_hours": 0.05,
     },
 ]
 
@@ -107,18 +117,82 @@ def _save_vuln(scan, finding, domain):
         description=finding.get("description") or "",
         remediation=finding.get("remediation") or "",
         reference=finding.get("reference") or "",
-        source_tool="PythonScanner",
+        source_tool=finding.get("source_tool") or "PythonScanner",
+        owasp_category=finding.get("owasp_category") or "",
+        owasp_rank=finding.get("owasp_rank") or 0,
+        confidence=finding.get("confidence", 0.7),
+        finding_status=finding.get("status") or "potential",
+        evidence=finding.get("evidence") or "",
     )
     return True
 
 
 # ── Core scanner ───────────────────────────────────────────────────────────────
 
+def _run_cve_enrichment_phase(scan_id, scan, domain):
+    """Correlate detected technologies/versions with NVD CVEs.
+
+    Reads the TechnologyResult rows already stored for this scan and queries
+    NVD for each (tech, version) pair, storing real CVE findings (with CVSS
+    score, severity and references) into VulnerabilityResult.
+    """
+    from .cve_enrichment import enrich_scan_with_technology_cves
+    from .models import TechnologyResult
+
+    try:
+        tech_map = {}
+        for tr in TechnologyResult.objects.filter(scan=scan):
+            tech_map[tr.domain] = tr.technologies or []
+        if not tech_map:
+            logger.info("CVE enrichment: no technologies recorded for scan %s", scan_id)
+            return 0
+        count = enrich_scan_with_technology_cves(scan, tech_map, domain)
+        if count:
+            logger.info("CVE enrichment stored %d findings for scan %s", count, scan_id)
+        return count
+    except Exception as exc:
+        logger.warning("CVE enrichment failed for scan %s: %s", scan_id, exc)
+        return 0
+
+
+def _run_owasp_top10_phase(scan_id, scan, domain, targets):
+    """
+    Run the OWASP Top 10 (A01-A10) engine and stream findings to the DB.
+    Returns number of findings stored.
+    """
+    from owasp_scanner.engine import run_owasp_top10_scan, save_owasp_findings
+
+    saved_count = 0
+    try:
+        logger.info("Starting OWASP Top 10 assessment for scan %s on %s", scan_id, domain)
+        result = run_owasp_top10_scan(domain, live_urls=targets or None)
+        findings = result.get("findings", [])
+        if findings:
+            saved_count = save_owasp_findings(scan, findings, domain)
+            new_total = get_live_state(scan_id).get("total_found", 0) + saved_count
+            _set_live_state(scan_id, total_found=new_total)
+            try:
+                scan.__class__.objects.filter(pk=scan.pk).update(nuclei_found=new_total)
+            except Exception:
+                pass
+            logger.info("OWASP Top 10 phase stored %d findings for scan %s", saved_count, scan_id)
+    except Exception as e:
+        logger.exception("OWASP Top 10 phase failed for scan %s: %s", scan_id, e)
+    return saved_count
+
+
 def _run_phase_streaming(scan_id, scan, domain, targets, phase, phase_idx):
     """
     Run a single Python vuln scanner phase, streaming results to DB.
     Returns count of vulnerabilities found in this phase.
     """
+    # OWASP Top 10 runs through its own engine (category-aware findings)
+    if phase.get("id") == "owasp_top10":
+        return _run_owasp_top10_phase(scan_id, scan, domain, targets)
+    # NVD CVE correlation runs against stored TechnologyResult rows
+    if phase.get("id") == "cve_enrichment":
+        return _run_cve_enrichment_phase(scan_id, scan, domain)
+
     found_count = 0
     phase_name = phase["name"]
 

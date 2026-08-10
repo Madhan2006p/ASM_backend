@@ -12,6 +12,8 @@ class AttackSurfaceScan(models.Model):
     target = models.CharField(max_length=255)
     status = models.CharField(max_length=50, choices=STATUS_CHOICES, default="pending")
     progress = models.IntegerField(default=0)
+    # Persisted failure reason (traceback excerpt) so failed scans can be diagnosed
+    error_message = models.TextField(blank=True, default="")
     org_id = models.CharField(max_length=50, default="1")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -189,12 +191,21 @@ class VulnerabilityResult(models.Model):
     severity = models.CharField(max_length=50, blank=True, null=True)
     cve = models.CharField(max_length=100, blank=True, null=True)
     cwe = models.CharField(max_length=100, blank=True, null=True)
+    # CVSS base score attached by NVD CVE enrichment (0.0-10.0)
+    cvss_score = models.FloatField(blank=True, null=True)
     finding = models.TextField(blank=True, null=True)
     description = models.TextField(blank=True, null=True)
     remediation = models.TextField(blank=True, null=True)
     reference = models.TextField(blank=True, null=True)
     template_id = models.CharField(max_length=255, blank=True, null=True)
     source_tool = models.CharField(max_length=255, blank=True, null=True, default="Nuclei")
+    # OWASP Top 10 classification (e.g. "A01:2021 - Broken Access Control")
+    owasp_category = models.CharField(max_length=200, blank=True, default="")
+    owasp_rank = models.IntegerField(default=0)  # 1-10, 0 = unclassified
+    # VulnMap: confidence (0.0-1.0), finding-status classification and captured evidence
+    confidence = models.FloatField(default=0.0, blank=True)
+    finding_status = models.CharField(max_length=32, blank=True, default="")
+    evidence = models.TextField(blank=True, default="")
     org_id = models.CharField(max_length=50, default="1")
     discovered_at = models.DateTimeField(auto_now_add=True)
 

@@ -27,6 +27,106 @@ WEAK_CIPHER_PATTERNS = {
 }
 
 
+def _check_ssl3_supported(host, port=443, timeout=5):
+    """Probe whether the server accepts an SSL 3.0 handshake (POODLE).
+
+    SSL 3.0 was formally deprecated and most modern stacks (OpenSSL 3.x)
+    refuse it, so a clean failure means POODLE is mitigated. Returns True
+    only when the handshake actually succeeds over SSLv3.
+    """
+    try:
+        if not hasattr(ssl, "TLSVersion") or not hasattr(ssl.TLSVersion, "SSLv3"):
+            return False
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.minimum_version = ssl.TLSVersion.SSLv3
+        ctx.maximum_version = ssl.TLSVersion.SSLv3
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                return True
+    except Exception:
+        return False
+
+
+# TLS protocol-level attacks the audit reports as named findings.
+PROTOCOL_ATTACKS = {
+    "BEAST": {
+        "vulnerability_id": "SSL-BEAST",
+        "cve": "CVE-2011-3389",
+        "cwe": "CWE-326",
+        "severity": "MEDIUM",
+        "title": "BEAST (Browser Exploit Against SSL/TLS)",
+        "description": "Exploits predictable IVs (Initialization Vectors) in CBC mode within SSL 3.0 and TLS 1.0 to decrypt cookies and session data. Enabled by support for TLS 1.0 with CBC-mode ciphers.",
+        "remediation": "Disable TLS 1.0 and SSL 3.0. Enforce TLS 1.2 or TLS 1.3 with AEAD (GCM) cipher suites only.",
+        "template_id": "ssl/attack/beast",
+    },
+    "POODLE": {
+        "vulnerability_id": "SSL-POODLE",
+        "cve": "CVE-2014-3566",
+        "cwe": "CWE-326",
+        "severity": "HIGH",
+        "title": "POODLE (Padding Oracle On Downgraded Legacy Encryption)",
+        "description": "Abuses fallback mechanisms in SSL 3.0 padding validation, forcing systems to downgrade and leak CBC ciphertext bytes. Requires SSL 3.0 support.",
+        "remediation": "Disable SSL 3.0 entirely and set TLS_FALLBACK_SCSV to block protocol-downgrade attacks.",
+        "template_id": "ssl/attack/poodle",
+    },
+    "LUCKY13": {
+        "vulnerability_id": "SSL-LUCKY13",
+        "cve": "CVE-2013-0169",
+        "cwe": "CWE-326",
+        "severity": "MEDIUM",
+        "title": "Lucky13 (CBC Padding Timing Side-Channel)",
+        "description": "Timing side-channel against CBC-mode ciphers in TLS 1.0-1.2 that can recover plaintext. Affects servers supporting CBC cipher suites on legacy TLS versions.",
+        "remediation": "Prefer AEAD cipher suites (GCM/ChaCha20-Poly1305) and disable CBC-mode ciphers on TLS 1.0/1.1.",
+        "template_id": "ssl/attack/lucky13",
+    },
+    "RC4": {
+        "vulnerability_id": "SSL-RC4-WEAKNESS",
+        "cve": "CVE-2013-2566",
+        "cwe": "CWE-326",
+        "severity": "HIGH",
+        "title": "RC4 Cipher Suite (Bar Mitzvah)",
+        "description": "RC4 stream cipher suffers from single-byte biases that leak plaintext over time.",
+        "remediation": "Disable RC4 cipher suites entirely.",
+        "template_id": "ssl/attack/rc4",
+    },
+    "3DES": {
+        "vulnerability_id": "SSL-SWEET32-3DES",
+        "cve": "CVE-2016-2183",
+        "cwe": "CWE-326",
+        "severity": "MEDIUM",
+        "title": "3DES / SWEET32",
+        "description": "64-bit block-size cipher vulnerable to the SWEET32 birthday attack on block ciphers.",
+        "remediation": "Disable 3DES/DES cipher suites (RFC 7465).",
+        "template_id": "ssl/attack/3des",
+    },
+}
+
+
+def _add_protocol_attack(results, host, port, attack_key, supported_hint=""):
+    """Append a named TLS attack finding (dedup-aware) and grade penalty."""
+    meta = PROTOCOL_ATTACKS[attack_key]
+    existing_ids = {v.get("vulnerability_id") for v in results["vulnerabilities"]}
+    if meta["vulnerability_id"] in existing_ids:
+        return
+    results["vulnerabilities"].append({
+        "vulnerability_id": meta["vulnerability_id"],
+        "domain": host,
+        "subdomain": host,
+        "severity": meta["severity"],
+        "cve": meta["cve"],
+        "cwe": meta["cwe"],
+        "finding": f"{meta['title']} - {supported_hint or 'legacy TLS/cipher support'} on {host}:{port}",
+        "template_id": meta["template_id"],
+        "source_tool": "PythonScanner",
+        "description": meta["description"],
+        "remediation": meta["remediation"],
+    })
+    penalty = {"CRITICAL": 40, "HIGH": 25, "MEDIUM": 15}.get(meta["severity"], 10)
+    results["attack_grade_penalty"] = results.get("attack_grade_penalty", 0) + penalty
+
+
 def _check_heartbleed(host, port=443, timeout=4):
     """Active TLS Heartbeat extension probe to test for OpenSSL Heartbleed (CVE-2014-0160)."""
     payload = bytearray.fromhex(
@@ -278,7 +378,7 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
                 elif sev == "MEDIUM":
                     grade_penalty += 15
 
-    # Check Deprecated Protocols (TLS 1.0, TLS 1.1, SSLv3)
+    # Check Deprecated Protocols (TLS 1.0, TLS 1.1, SSLv3) + named TLS attacks
     if "TLSv1.0" in results["supported_protocols"] or "TLSv1" in results["supported_protocols"]:
         grade_penalty += 25
         results["vulnerabilities"].append({
@@ -294,6 +394,8 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "description": "TLS 1.0 is deprecated (RFC 8996) and vulnerable to BEAST attacks.",
             "remediation": "Disable TLS 1.0 and enforce TLS 1.2 or TLS 1.3."
         })
+        # BEAST: TLS 1.0 CBC predictable-IV attack
+        _add_protocol_attack(results, host, port, "BEAST", "TLS 1.0 enabled")
 
     if "TLSv1.1" in results["supported_protocols"]:
         grade_penalty += 15
@@ -310,6 +412,30 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "description": "TLS 1.1 is deprecated (RFC 8996).",
             "remediation": "Disable TLS 1.1 and enforce TLS 1.2 or TLS 1.3."
         })
+
+    # POODLE: SSL 3.0 support
+    if _check_ssl3_supported(host, port, timeout):
+        grade_penalty += 25
+        _add_protocol_attack(results, host, port, "POODLE", "SSL 3.0 accepted")
+
+    # Lucky13: CBC-mode cipher on legacy TLS (1.0/1.1) or any negotiated CBC suite
+    legacy_tls = any(
+        p in results["supported_protocols"] for p in ("TLSv1.0", "TLSv1.1", "TLSv1")
+    )
+    cbc_cipher = any("-CBC" in c.upper() for c in results["ciphers"])
+    if legacy_tls or cbc_cipher:
+        _add_protocol_attack(
+            results, host, port, "LUCKY13",
+            "CBC ciphers on legacy TLS" if cbc_cipher else "TLS 1.0/1.1 enabled",
+        )
+
+    # Named RC4 / 3DES findings (dedup-safe with the cipher-pattern findings)
+    for cipher_name, ver, bits in tested_ciphers:
+        cipher_upper = cipher_name.upper()
+        if "RC4" in cipher_upper:
+            _add_protocol_attack(results, host, port, "RC4", f"{cipher_name} ({ver})")
+        if "3DES" in cipher_upper or "DES-CBC3" in cipher_upper:
+            _add_protocol_attack(results, host, port, "3DES", f"{cipher_name} ({ver})")
 
     # Check OpenSSL Heartbleed Vulnerability
     if _check_heartbleed(host, port, timeout):
@@ -331,6 +457,9 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
     # Compute SSL Grade
     if not results["is_trusted"]:
         grade_penalty += 30
+
+    # Named TLS attack findings (BEAST/POODLE/Lucky13/RC4/3DES) also reduce the grade
+    grade_penalty += results.get("attack_grade_penalty", 0)
 
     base_score = 100 - grade_penalty
     if base_score >= 95:

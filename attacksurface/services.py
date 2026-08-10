@@ -35,7 +35,11 @@ from .models import (
 from .faraday_import import import_vulnerabilities_to_faraday
 
 # Cross-module vulnerability deduplication & python scanner
-from .scanner.vulnerability_scanner import deduplicate_vulnerabilities, run_python_vuln_scanner
+from .scanner.vulnerability_scanner import (
+    deduplicate_vulnerabilities,
+    redirects_to_https,
+    run_python_vuln_scanner,
+)
 
 WAPPALYZER_AVAILABLE = False
 try:
@@ -802,9 +806,17 @@ def run_python_vuln_scanner(target, httpx_results, port_results=None):
                 "source_tool": "PythonScanner",
             })
 
-        # 4. Plaintext HTTP (no TLS)
+        # 4. Plaintext HTTP (no TLS) — skipped when the endpoint redirects to HTTPS.
+        #    Also skipped when the endpoint was never observed responding (status 0 /
+        #    None): an unreachable host is not evidence of a plaintext exposure.
         dedup_key = (host, "HTTP-PLAINTEXT")
-        if url.startswith("http://") and not url.startswith("https://") and dedup_key not in dedup:
+        if (
+            url.startswith("http://")
+            and not url.startswith("https://")
+            and status not in (0, None)
+            and not redirects_to_https(url)
+            and dedup_key not in dedup
+        ):
             dedup.add(dedup_key)
             vulns.append({
                 "vulnerability_id": "HTTP-PLAINTEXT",
@@ -1209,6 +1221,14 @@ def mark_phase(scan, phase_field, progress):
     setattr(scan, phase_field, True)
     scan.progress = progress
     scan.save(update_fields=[phase_field, "progress"])
+    print(f"  [scan {scan.id}] {phase_field} -> progress {progress}%", flush=True)
+
+
+def log_scan_progress(scan, message):
+    """Print a live progress line to the terminal so scans started from the
+    command line or dev server are visible in real time."""
+    print(f"  [scan {scan.id}] {message}", flush=True)
+    logger.info("[scan %s] %s", scan.id, message)
 
 
 # ── Full Scan Orchestrator ───────────────────────────────────────────────────
@@ -1246,6 +1266,7 @@ def run_full_scan(scan):
 
         # ── Phase 1: Subdomain Discovery ──────────────────────────────────────
         current_time = timezone.now()
+        log_scan_progress(scan, "Phase 1: Subdomain discovery...")
 
         subdomains = run_subfinder(target)
         if not subdomains:
@@ -1321,6 +1342,7 @@ def run_full_scan(scan):
         mark_phase(scan, "subdomains_done", 15)
 
         # ── Phase 2: Live Host Probing (Python httpx) ─────────────────────────
+        log_scan_progress(scan, f"Phase 2: Probing {len(subdomains)} hosts for live endpoints...")
         httpx_results = run_httpx(subdomains)
         live_urls = []
         for h in httpx_results:
@@ -1342,6 +1364,7 @@ def run_full_scan(scan):
 
         # ── Phase 3: Port scanning ───────────────────────────────────────────
         vuln_count_map = {}
+        log_scan_progress(scan, f"Phase 3: Port scanning {len(all_scan_targets)} targets...")
 
         scan.progress = 30
         scan.save(update_fields=["progress"])
@@ -1399,6 +1422,7 @@ def run_full_scan(scan):
         mark_phase(scan, "ports_done", 45)
 
         # ── Phase 4: Directory Scanning ──────────────────────────────────────
+        log_scan_progress(scan, f"Phase 4: Directory scanning {len(live_urls)} live URLs...")
         # Only real scanner output is stored — no fabricated entries. Each
         # result carries the content-based classification (category, risk,
         # access status, sensitivity evidence) computed by the analysis engine.
@@ -1428,21 +1452,28 @@ def run_full_scan(scan):
         mark_phase(scan, "directories_done", 55)
 
         # ── Phase 5: Technology Detection (Wappalyzer + header analysis + WhatCMS) ──────
-        from .scanner.whatcms_scanner import run_whatcms
-        whatcms_results = run_whatcms(subdomains)
+        log_scan_progress(scan, "Phase 5: Technology fingerprinting (Wappalyzer/WhatCMS/headers)...")
         whatcms_tech_map = {}
-        for wr in whatcms_results:
-            dom = wr.get("domain", "")
-            if dom:
-                whatcms_tech_map[dom] = wr.get("technologies", [])
+        wapp_tech_map = {}
+        try:
+            from .scanner.whatcms_scanner import run_whatcms
+            whatcms_results = run_whatcms(subdomains) or []
+            for wr in whatcms_results:
+                dom = wr.get("domain", "")
+                if dom:
+                    whatcms_tech_map[dom] = wr.get("technologies", [])
+        except Exception as e:
+            logger.warning("WhatCMS phase failed for %s: %s", target, e)
 
         # Fast Node.js Wappalyzer with headless browser disabled
-        wappalyzer_results = run_wappalyzer(subdomains)
-        wapp_tech_map = {}
-        for wr in wappalyzer_results:
-            dom = wr.get("domain", "")
-            if dom:
-                wapp_tech_map[dom] = [f"{t} [Wappalyzer]" for t in wr.get("technologies", [])]
+        try:
+            wappalyzer_results = run_wappalyzer(subdomains) or []
+            for wr in wappalyzer_results:
+                dom = wr.get("domain", "")
+                if dom:
+                    wapp_tech_map[dom] = [f"{t} [Wappalyzer]" for t in wr.get("technologies", [])]
+        except Exception as e:
+            logger.warning("Wappalyzer phase failed for %s: %s", target, e)
         header_techs = run_header_tech_analysis(subdomains, httpx_results)
 
         # Merge all techs per host
@@ -1539,21 +1570,50 @@ def run_full_scan(scan):
 
         mark_phase(scan, "technologies_done", 65)
 
+        # ── Phase 5b: NVD CVE enrichment (background, non-blocking) ───────────
+        # Detected components that disclose a version are matched against the
+        # NVD API; real CVE findings (with CVSS score + references) are stored
+        # to VulnerabilityResult in a background thread so the scan never waits
+        # on external rate-limited lookups.
+        def _cve_enrich_background():
+            try:
+                from .cve_enrichment import enrich_scan_with_technology_cves
+                count = enrich_scan_with_technology_cves(scan, combined_tech_map, target)
+                if count:
+                    log_scan_progress(scan, f"Phase 5b: NVD CVE enrichment added {count} findings")
+            except Exception as exc:
+                logger.warning("NVD CVE enrichment failed for %s: %s", target, exc)
+            finally:
+                from django.db import connection
+                connection.close()
+
+        import threading  # explicit import (do not rely on side-effect import above)
+        threading.Thread(target=_cve_enrich_background, daemon=True).start()
+
         # ── Phase 6: Email security ───────────────────────────────────────────
+        log_scan_progress(scan, "Phase 6: Email security (SPF/DMARC/DKIM/STARTTLS)")
         try:
             email_results = run_email_security(target)
-        except Exception:
+        except Exception as e:
+            logger.warning("Email security scan failed for %s: %s", target, e)
             email_results = {}
 
         # Email Security Mapping
         email_data = {k: v for k, v in email_results.items() if k != "domain"}
 
-        EmailSecurityResult.objects.create(
-            scan=scan, domain=target, org_id=org_id, **email_data,
-        )
+        # Guarded write: a transient DB error here must NOT fail the whole scan
+        try:
+            EmailSecurityResult.objects.update_or_create(
+                scan=scan, domain=target,
+                defaults={**email_data, "org_id": org_id},
+            )
+            log_scan_progress(scan, f"Phase 6: Email security done ({len(email_data)} checks)")
+        except Exception as e:
+            logger.warning("Email security result save failed for %s: %s", target, e)
         mark_phase(scan, "email_done", 70)
 
         # ── Phase 7a: Fast Basic Vulnerability Scan (Inline) ─────────────────────
+        log_scan_progress(scan, "Phase 7a: Vulnerability scan (headers, exposures, misconfigs)...")
         scan.progress = 70
         scan.save(update_fields=["progress"])
         # Collect all detected technologies across hosts for targeted scanning
@@ -1654,6 +1714,7 @@ def run_full_scan(scan):
         scan.save(update_fields=["vulnerabilities_done", "vuln_scan_phase", "progress"])
         
         # ── Phase 7b: Deep Vulnerability Scan (Background Thread) ──────────────
+        log_scan_progress(scan, "Phase 7b: Deep vulnerability scan started in background...")
         logger.info("Phase 7b: Starting deep dynamic vulnerability background task...")
 
         def _dynamic_deep_scan():
@@ -1755,6 +1816,7 @@ def run_full_scan(scan):
         threading.Thread(target=_dynamic_deep_scan, daemon=True).start()
 
         # ── Phase 8: SSL scanning ─────────────────────────────────────────────
+        log_scan_progress(scan, "Phase 8: SSL/TLS certificate scanning...")
         scan.progress = 85
         scan.save(update_fields=["progress"])
         unique_hostnames = list(dict.fromkeys(hostnames))
@@ -1835,6 +1897,7 @@ def run_full_scan(scan):
         mark_phase(scan, "ssl_done", 90)
 
         # ── Phase 9: Anti-Malware (VirusTotal Audit) ──────────────────────────
+        log_scan_progress(scan, "Phase 9: Anti-malware / brand monitoring...")
         logger.info("Phase 9: VirusTotal check for target=%s", target)
         try:
             from brand_monitoring.models import BrandMonitorTarget, SuspiciousDomainReport, ImpersonatingScan
@@ -1923,11 +1986,16 @@ def run_full_scan(scan):
         # ── Done ─────────────────────────────────────────────────────────────
         scan.status = "completed"
         scan.save(update_fields=["status"])
+        log_scan_progress(scan, "Scan COMPLETED ✓")
 
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
         scan.status = "failed"
-        scan.save(update_fields=["status"])
+        scan.error_message = f"{type(e).__name__}: {e}\n{tb[-2000:]}"
+        scan.save(update_fields=["status", "error_message", "progress"])
         logger.exception("Scan failed: %s", e)
+        print(f"  [scan {scan.id}] FAILED: {type(e).__name__}: {e}", flush=True)
     finally:
         from django.db import connection
         connection.close()

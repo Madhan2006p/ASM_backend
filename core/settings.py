@@ -107,6 +107,9 @@ if use_sqlite or db_engine == 'django.db.backends.sqlite3':
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
             'NAME': BASE_DIR / 'db.sqlite3',
+            # Busy timeout (60s) prevents intermittent 'database is locked'
+            # failures when multiple scan threads write concurrently.
+            'OPTIONS': {'timeout': 60},
         }
     }
 else:
@@ -294,6 +297,55 @@ MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# ─── Logging ────────────────────────────────────────────────────────────────
+# Sends all app log output (scan phase progress, errors) to the terminal so
+# that scans started from the command line / dev server are visible live.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '[%(asctime)s] %(levelname)-8s %(name)s: %(message)s',
+            'datefmt': '%H:%M:%S',
+        },
+        'simple': {
+            'format': '%(levelname)s %(message)s',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
+    },
+    'loggers': {
+        'attacksurface': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'scans': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'django': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'django.server': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}
 
 # ── MobSF settings ───────────────────────────────────────────────────────────
 MOBSF_URL = os.getenv('MOBSF_URL', 'http://localhost:8002')
