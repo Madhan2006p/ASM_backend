@@ -105,17 +105,12 @@ class FileUploadView(APIView):
                     scan.status = 'upload_failed'
                     scan.save()
             except Exception as e:
-                logger.warning(f"MobSF unavailable, running standalone APK analysis fallback: {e}")
+                logger.error(f"Error in background scan thread: {e}", exc_info=True)
                 try:
-                    scan.status = 'completed'
-                    scan.app_name = scan.file_name.replace('.apk', '').replace('.aab', '').replace('.ipa', '').capitalize()
-                    scan.package_name = f"com.app.{scan.file_name.replace('.apk', '').replace('.aab', '').replace('.ipa', '').lower()}"
-                    scan.version_name = '1.0.0'
-                    scan.score = '78'
+                    scan.status = 'scan_failed'
                     scan.save()
-                    self._store_fallback_mobile_data(scan)
-                except Exception as fallback_err:
-                    logger.error(f"Fallback mobile scan error: {fallback_err}")
+                except Exception:
+                    pass
             finally:
                 # Stop the MobSF Docker container now that scanning is done
                 try:
@@ -282,52 +277,6 @@ class FileUploadView(APIView):
                 category='File Analysis',
                 file_path=file_str[:500],
             )
-
-    def _store_fallback_mobile_data(self, scan):
-        """
-        Fallback generator for findings, permissions, and security scores when MobSF engine is offline.
-        """
-        if not MobileFinding.objects.filter(scan=scan).exists():
-            MobileFinding.objects.create(
-                scan=scan,
-                vulnerability='App Debuggable Flag Enabled in Manifest',
-                severity='CRITICAL',
-                description='android:debuggable is set to true in AndroidManifest.xml.',
-                category='Manifest Analysis',
-                file_path='AndroidManifest.xml',
-                line_number=12,
-                recommendation='Disable debugging before releasing the production APK.'
-            )
-            MobileFinding.objects.create(
-                scan=scan,
-                vulnerability='Insecure Hardcoded API Key Discovered',
-                severity='HIGH',
-                description='Hardcoded secret key found in com/app/network/ApiClient.java',
-                category='Code Analysis',
-                file_path='com/app/network/ApiClient.java',
-                line_number=42,
-                recommendation='Remove hardcoded secret credentials and use key store storage.'
-            )
-            MobileFinding.objects.create(
-                scan=scan,
-                vulnerability='Cleartext HTTP Traffic Allowed',
-                severity='MEDIUM',
-                description='Network Security Config allows unencrypted HTTP traffic.',
-                category='Network Security',
-                file_path='res/xml/network_security_config.xml',
-                line_number=5,
-                recommendation='Enforce HTTPS/TLS for all domain connections.'
-            )
-
-        if not MobilePermission.objects.filter(scan=scan).exists():
-            MobilePermission.objects.create(scan=scan, permission_name='android.permission.INTERNET', status='DANGEROUS', severity='HIGH', description='Allows full network access')
-            MobilePermission.objects.create(scan=scan, permission_name='android.permission.WRITE_EXTERNAL_STORAGE', status='DANGEROUS', severity='HIGH', description='Allows writing to SD card')
-            MobilePermission.objects.create(scan=scan, permission_name='android.permission.ACCESS_FINE_LOCATION', status='DANGEROUS', severity='HIGH', description='Allows accessing precise GPS location')
-
-        if not SecurityScore.objects.filter(scan=scan).exists():
-            SecurityScore.objects.create(scan=scan, category='Code Security', score=75, max_score=100)
-            SecurityScore.objects.create(scan=scan, category='Manifest Security', score=80, max_score=100)
-            SecurityScore.objects.create(scan=scan, category='Network Security', score=70, max_score=100)
 
     def _store_permissions(self, scan, report):
         """

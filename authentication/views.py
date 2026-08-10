@@ -111,30 +111,25 @@ class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        raw_email = (request.data.get("email") or request.data.get("username") or "").strip()
-        raw_password = (request.data.get("password") or "").strip()
+        email_or_user = request.data.get("email") or request.data.get("username") or ""
+        password = request.data.get("password", "")
 
-        if not raw_email or not raw_password:
-            return Response(
-                {"error": "Username/Email and Password are required"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        username = email_or_user
+        if email_or_user:
+            user_obj = User.objects.filter(username__iexact=email_or_user).first()
+            if not user_obj:
+                user_obj = User.objects.filter(email__iexact=email_or_user).first()
+            if user_obj:
+                username = user_obj.username
 
-        # Find user by exact or case-insensitive match on username or email
-        user_obj = User.objects.filter(username__iexact=raw_email).first()
-        if not user_obj:
-            user_obj = User.objects.filter(email__iexact=raw_email).first()
-        if not user_obj and "@" in raw_email:
-            prefix = raw_email.split("@")[0]
-            user_obj = User.objects.filter(username__iexact=prefix).first()
-
-        user = None
-        if user_obj:
-            if user_obj.check_password(raw_password) and user_obj.is_active:
-                user = user_obj
-
-        if not user:
-            user = authenticate(request=request, username=raw_email, password=raw_password)
+        user = authenticate(request=request, username=username, password=password)
+        if not user and username:
+            try:
+                u = User.objects.filter(username__iexact=username).first()
+                if u and u.check_password(password) and u.is_active:
+                    user = u
+            except Exception:
+                pass
 
         if not user:
             return Response(

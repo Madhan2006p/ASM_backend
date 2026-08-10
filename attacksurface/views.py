@@ -1,7 +1,4 @@
-import logging
 import threading
-
-logger = logging.getLogger(__name__)
 
 from rest_framework import permissions, status
 from rest_framework.generics import ListAPIView, RetrieveAPIView
@@ -97,16 +94,19 @@ class AttackSurfaceBaseView(ListAPIView):
             scan = None
 
         if scan:
-            if self.request.user.is_superuser or scan.org_id == org_id or not scan.org_id:
-                return self.model.objects.filter(scan_id=scan_id_int)
+            if scan.org_id == org_id:
+                # Correct organization
+                return self.model.objects.filter(org_id=org_id, scan_id=scan_id_int)
             else:
+                # Mismatch! The scan belongs to another organization.
+                # Find the latest scan for the same target domain in this organization.
                 fallback_scan = AttackSurfaceScan.objects.filter(
-                    target=scan.target
+                    org_id=org_id, target=scan.target
                 ).order_by("-created_at").first()
                 if fallback_scan:
-                    return self.model.objects.filter(scan_id=fallback_scan.id)
+                    return self.model.objects.filter(org_id=org_id, scan_id=fallback_scan.id)
                     
-        return self.model.objects.filter(scan_id=scan_id)
+        return self.model.objects.filter(org_id=org_id, scan_id=scan_id)
 
     def list(self, request, *args, **kwargs):
         response = super().list(request, *args, **kwargs)
@@ -531,13 +531,9 @@ class ClearDatabaseView(APIView):
             ("spiderfoot_scans", SpiderfootScan),
         ]
         for name, model in models_in_order:
-            try:
-                c = model.objects.filter(org_id=org_id).count()
-                model.objects.filter(org_id=org_id).delete()
-                counts[name] = c
-            except Exception as e:
-                logger.warning("Could not clear %s table in ClearDatabaseView: %s", name, e)
-                counts[name] = 0
+            c = model.objects.filter(org_id=org_id).count()
+            model.objects.filter(org_id=org_id).delete()
+            counts[name] = c
         return Response({"deleted": counts, "message": "Scan data cleared for organization"})
 
 
@@ -994,133 +990,109 @@ class ExecutiveDashboardSummaryView(APIView):
             })
 
         # === Mobile VAPT ===
-        try:
-            mobile_scans = MobileScan.objects.all()
-            mobile_findings = MobileFinding.objects.all()
-            
-            mobile_scans_count = mobile_scans.count()
-            mobile_findings_count = mobile_findings.count()
-            
-            mobile_findings_by_severity = {
-                'high': mobile_findings.filter(severity__in=['HIGH', 'high', 'High']).count(),
-                'medium': mobile_findings.filter(severity__in=['MEDIUM', 'medium', 'Medium']).count(),
-                'info': mobile_findings.filter(severity__in=['INFO', 'info', 'Info']).count()
-            }
-            
-            mobile_scans_list = []
-            for ms in mobile_scans.order_by('-uploaded_at')[:5]:
-                mobile_scans_list.append({
-                    'app_name': getattr(ms, 'app_name', None) or getattr(ms, 'file_name', None) or 'Unknown App',
-                    'package_name': getattr(ms, 'package_name', '') or '',
-                    'score': getattr(ms, 'score', 'N/A') or 'N/A',
-                    'status': getattr(ms, 'status', 'Completed'),
-                    'uploaded_at': ms.uploaded_at.strftime("%Y-%m-%d") if getattr(ms, 'uploaded_at', None) else ""
-                })
-        except Exception as e:
-            logger.warning("Mobile VAPT query skipped in ExecutiveDashboardSummaryView: %s", e)
-            mobile_scans_count = 0
-            mobile_findings_count = 0
-            mobile_findings_by_severity = {'high': 0, 'medium': 0, 'info': 0}
-            mobile_scans_list = []
+        mobile_scans = MobileScan.objects.all()
+        mobile_findings = MobileFinding.objects.all()
+        
+        mobile_scans_count = mobile_scans.count()
+        mobile_findings_count = mobile_findings.count()
+        
+        mobile_findings_by_severity = {
+            'high': mobile_findings.filter(severity__in=['HIGH', 'high', 'High']).count(),
+            'medium': mobile_findings.filter(severity__in=['MEDIUM', 'medium', 'Medium']).count(),
+            'info': mobile_findings.filter(severity__in=['INFO', 'info', 'Info']).count()
+        }
+        
+        mobile_scans_list = []
+        for ms in mobile_scans.order_by('-uploaded_at')[:5]:
+            mobile_scans_list.append({
+                'app_name': ms.app_name or ms.file_name or 'Unknown App',
+                'package_name': ms.package_name or '',
+                'score': ms.score or 'N/A',
+                'status': ms.status,
+                'uploaded_at': ms.uploaded_at.strftime("%Y-%m-%d")
+            })
 
         # === Email Security ===
-        try:
-            email_results = EmailSecurityResult.objects.filter(scan_id__in=scan_ids)
-            email_sec = email_results.first()
-            
-            spf_valid = len(email_sec.spf) > 0 if (email_sec and email_sec.spf) else False
-            dmarc_valid = len(email_sec.dmarc) > 0 if (email_sec and email_sec.dmarc) else False
-            mx_valid = len(email_sec.mx) > 0 if (email_sec and email_sec.mx) else False
-            starttls_supported = email_sec.smtp_starttls.get('supported', False) if (email_sec and isinstance(email_sec.smtp_starttls, dict)) else False
+        email_results = EmailSecurityResult.objects.filter(scan_id__in=scan_ids)
+        email_sec = email_results.first()
+        
+        spf_valid = len(email_sec.spf) > 0 if (email_sec and email_sec.spf) else False
+        dmarc_valid = len(email_sec.dmarc) > 0 if (email_sec and email_sec.dmarc) else False
+        mx_valid = len(email_sec.mx) > 0 if (email_sec and email_sec.mx) else False
+        starttls_supported = email_sec.smtp_starttls.get('supported', False) if (email_sec and isinstance(email_sec.smtp_starttls, dict)) else False
 
-            email_score = 0
-            if spf_valid: email_score += 40
-            if dmarc_valid: email_score += 40
-            if mx_valid: email_score += 10
-            if starttls_supported: email_score += 10
-            
-            email_security_data = {
-                "spf_valid": spf_valid,
-                "dmarc_valid": dmarc_valid,
-                "mx_valid": mx_valid,
-                "starttls_supported": starttls_supported,
-                "score": email_score,
-                "domain": email_sec.domain if email_sec else (selected_domain or "No Scan Data")
-            }
-        except Exception as e:
-            logger.warning("Email Security query skipped in ExecutiveDashboardSummaryView: %s", e)
-            email_security_data = {
-                "spf_valid": False, "dmarc_valid": False, "mx_valid": False,
-                "starttls_supported": False, "score": 0, "domain": selected_domain or "No Scan Data"
-            }
+        email_score = 0
+        if spf_valid: email_score += 40
+        if dmarc_valid: email_score += 40
+        if mx_valid: email_score += 10
+        if starttls_supported: email_score += 10
+        
+        email_security_data = {
+            "spf_valid": spf_valid,
+            "dmarc_valid": dmarc_valid,
+            "mx_valid": mx_valid,
+            "starttls_supported": starttls_supported,
+            "score": email_score,
+            "domain": email_sec.domain if email_sec else (selected_domain or "No Scan Data")
+        }
 
         # === Brand Monitoring ===
-        try:
-            if selected_domain:
-                suspicious_count = SuspiciousDomainReport.objects.filter(org_id=org_id, domain__contains=selected_domain).count()
-                phishing_count = PhishingDomainReport.objects.filter(org_id=org_id, domain__contains=selected_domain).count()
-            else:
-                suspicious_count = SuspiciousDomainReport.objects.filter(org_id=org_id).count()
-                phishing_count = PhishingDomainReport.objects.filter(org_id=org_id).count()
-                
-            impersonating_count = ImpersonatingAccountResult.objects.filter(org_id=org_id).count()
+        if selected_domain:
+            suspicious_count = SuspiciousDomainReport.objects.filter(org_id=org_id, domain__contains=selected_domain).count()
+            phishing_count = PhishingDomainReport.objects.filter(org_id=org_id, domain__contains=selected_domain).count()
+        else:
+            suspicious_count = SuspiciousDomainReport.objects.filter(org_id=org_id).count()
+            phishing_count = PhishingDomainReport.objects.filter(org_id=org_id).count()
             
-            vt_qs = VirusTotalReport.objects.filter(org_id=org_id)
-            if selected_domain:
-                vt_qs = vt_qs.filter(domain__contains=selected_domain)
-            
+        impersonating_count = ImpersonatingAccountResult.objects.filter(org_id=org_id).count()
+        
+        vt_qs = VirusTotalReport.objects.filter(org_id=org_id)
+        if selected_domain:
+            vt_qs = vt_qs.filter(domain__contains=selected_domain)
+        
+        vt_data = {
+            "malicious": 0,
+            "suspicious": 0,
+            "harmless": 0,
+            "undetected": 0,
+            "reputation_score": 100
+        }
+        latest_vt = vt_qs.order_by('-checked_at').first()
+        if latest_vt:
             vt_data = {
-                "malicious": 0, "suspicious": 0, "harmless": 0, "undetected": 0, "reputation_score": 100
+                "malicious": latest_vt.malicious,
+                "suspicious": latest_vt.suspicious,
+                "harmless": latest_vt.harmless,
+                "undetected": latest_vt.undetected,
+                "reputation_score": latest_vt.reputation_score
             }
-            latest_vt = vt_qs.order_by('-checked_at').first()
-            if latest_vt:
-                vt_data = {
-                    "malicious": latest_vt.malicious,
-                    "suspicious": latest_vt.suspicious,
-                    "harmless": latest_vt.harmless,
-                    "undetected": latest_vt.undetected,
-                    "reputation_score": latest_vt.reputation_score
-                }
 
-            impersonating_accounts = []
-            for acc in ImpersonatingAccountResult.objects.filter(org_id=org_id).order_by('-created_at')[:5]:
-                impersonating_accounts.append({
-                    "username": acc.username,
-                    "platform": acc.platform_label or acc.platform,
-                    "followers": acc.followers or 0,
-                    "action_status": acc.action_status or "Detected"
-                })
-        except Exception as e:
-            logger.warning("Brand Monitoring query skipped in ExecutiveDashboardSummaryView: %s", e)
-            suspicious_count = 0
-            phishing_count = 0
-            impersonating_count = 0
-            vt_data = {"malicious": 0, "suspicious": 0, "harmless": 0, "undetected": 0, "reputation_score": 100}
-            impersonating_accounts = []
+        impersonating_accounts = []
+        for acc in ImpersonatingAccountResult.objects.filter(org_id=org_id).order_by('-created_at')[:5]:
+            impersonating_accounts.append({
+                "username": acc.username,
+                "platform": acc.platform_label or acc.platform,
+                "followers": acc.followers or 0,
+                "action_status": acc.action_status or "Detected"
+            })
 
         # === Surface Web (OSINT) ===
-        try:
-            from surface_monitoring.models import SpiderfootScan, SpiderfootResult
-            sf_qs = SpiderfootScan.objects.filter(org_id=org_id)
-            if selected_domain:
-                sf_qs = sf_qs.filter(target=selected_domain)
-                
-            sf_scans_count = sf_qs.count()
-            sf_results_count = SpiderfootResult.objects.filter(scan__in=sf_qs).count()
+        from surface_monitoring.models import SpiderfootScan, SpiderfootResult
+        sf_qs = SpiderfootScan.objects.filter(org_id=org_id)
+        if selected_domain:
+            sf_qs = sf_qs.filter(target=selected_domain)
             
-            sf_findings_list = []
-            for r in SpiderfootResult.objects.filter(scan__in=sf_qs).order_by('-created_at')[:5]:
-                sf_findings_list.append({
-                    "data_type": r.data_type,
-                    "data_value": r.data_value[:60] if r.data_value else "",
-                    "module": r.module,
-                    "created_at": r.created_at.strftime("%Y-%m-%d")
-                })
-        except Exception as e:
-            logger.warning("Surface Web query skipped in ExecutiveDashboardSummaryView: %s", e)
-            sf_scans_count = 0
-            sf_results_count = 0
-            sf_findings_list = []
+        sf_scans_count = sf_qs.count()
+        sf_results_count = SpiderfootResult.objects.filter(scan__in=sf_qs).count()
+        
+        sf_findings_list = []
+        for r in SpiderfootResult.objects.filter(scan__in=sf_qs).order_by('-created_at')[:5]:
+            sf_findings_list.append({
+                "data_type": r.data_type,
+                "data_value": r.data_value[:60] if r.data_value else "",
+                "module": r.module,
+                "created_at": r.created_at.strftime("%Y-%m-%d")
+            })
 
         return Response({
             "metrics": {

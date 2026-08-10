@@ -1,226 +1,251 @@
 """
-Deep Nuclei & Vulnerability Scanner Engine.
-Provides background threading, live state tracking, and template phase execution.
+Deep Python Vulnerability Scan Engine
+------------------------------------
+Runs Python-based vulnerability checks across structured phases.
+• Saves each vulnerability to DB as soon as it is found (real-time streaming).
+• Tracks current phase and progress on the AttackSurfaceScan model.
+• Operates without external binaries (Nuclei/Wapiti).
 """
+
+import json
 import logging
 import threading
 import time
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
+
+from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
+from .scanner.vulnerability_scanner import run_python_vuln_scanner
 
 logger = logging.getLogger(__name__)
 
-# Global in-memory tracking of live scan states
-_LIVE_SCAN_STATES = {}
-_LIVE_LOCK = threading.Lock()
-
+# ── Phase definitions ──────────────────────────────────────────────────────────
 SCAN_PHASES = [
-    {"id": "misconfig", "name": "Security Misconfigurations & Headers", "est_hours": 0.05},
-    {"id": "exposure", "name": "Exposed Sensitive Files & Admin Panels", "est_hours": 0.05},
-    {"id": "ssl_tls", "name": "SSL/TLS & Cryptographic Audits", "est_hours": 0.05},
-    {"id": "cves", "name": "Known CVEs & Vulnerabilities", "est_hours": 0.1},
-    {"id": "owasp", "name": "OWASP Top 10 Web Vulnerabilities", "est_hours": 0.1},
-    {"id": "technologies", "name": "Technology-Specific Exploits", "est_hours": 0.05},
-    {"id": "default_logins", "name": "Default Credentials & Auth Bypasses", "est_hours": 0.05},
+    {
+        "id": "exposures",
+        "name": "Exposed Files & Sensitive Endpoints",
+        "est_hours": 0.1,
+    },
+    {
+        "id": "misconfiguration",
+        "name": "HTTP & Server Misconfigurations",
+        "est_hours": 0.1,
+    },
+    {
+        "id": "security_headers",
+        "name": "Security Headers & Policies",
+        "est_hours": 0.1,
+    },
+    {
+        "id": "cookie_session",
+        "name": "Cookie Flags & Session Security",
+        "est_hours": 0.1,
+    },
+    {
+        "id": "cors_methods",
+        "name": "CORS & Dangerous HTTP Methods",
+        "est_hours": 0.1,
+    },
+    {
+        "id": "exposed_ports",
+        "name": "Sensitive Network Ports & Services",
+        "est_hours": 0.1,
+    },
 ]
 
 
+# ── State tracking model (in-memory + DB) ─────────────────────────────────────
+
+# This dict tracks the live state of any running deep scan per scan_id
+# { scan_id: { "phase_idx": int, "phase_name": str, "started_at": datetime,
+#              "total_found": int, "stop": bool } }
+_LIVE_STATE = {}
+_STATE_LOCK = threading.Lock()
+
+
 def get_live_state(scan_id):
-    """Retrieve live scanning state for a scan_id."""
-    with _LIVE_LOCK:
-        state = _LIVE_SCAN_STATES.get(int(scan_id)) if str(scan_id).isdigit() else None
-        if state:
-            return dict(state)
-        return None
+    with _STATE_LOCK:
+        return _LIVE_STATE.get(scan_id, {}).copy()
 
 
-def update_live_state(scan_id, **kwargs):
-    """Update in-memory live scan status."""
-    with _LIVE_LOCK:
-        sid = int(scan_id) if str(scan_id).isdigit() else scan_id
-        if sid not in _LIVE_SCAN_STATES:
-            _LIVE_SCAN_STATES[sid] = {
-                "scan_id": sid,
-                "status": "running",
-                "phase_idx": 0,
-                "phase_id": SCAN_PHASES[0]["id"],
-                "phase_name": SCAN_PHASES[0]["name"],
-                "total_phases": len(SCAN_PHASES),
-                "total_found": 0,
-                "remaining_est_hours": 0.45,
-                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "completed_at": "",
-            }
-        _LIVE_SCAN_STATES[sid].update(kwargs)
+def _set_live_state(scan_id, **kwargs):
+    with _STATE_LOCK:
+        if scan_id not in _LIVE_STATE:
+            _LIVE_STATE[scan_id] = {}
+        _LIVE_STATE[scan_id].update(kwargs)
 
 
-def start_deep_scan_thread(scan_id, target, live_urls=None):
+def stop_deep_scan(scan_id):
+    """Signal the running deep scan thread to stop cleanly."""
+    with _STATE_LOCK:
+        if scan_id in _LIVE_STATE:
+            _LIVE_STATE[scan_id]["stop"] = True
+
+
+# ── DB helper ──────────────────────────────────────────────────────────────────
+
+def _save_vuln(scan, finding, domain):
+    """Save a single vulnerability to the DB if it hasn't been saved yet."""
+    template_id = finding.get("template_id") or finding.get("vulnerability_id") or "python-vuln"
+    target = finding.get("target") or finding.get("subdomain") or domain
+
+    if VulnerabilityResult.objects.filter(scan=scan, template_id=template_id, subdomain=target).exists():
+        return False
+
+    VulnerabilityResult.objects.create(
+        scan=scan,
+        domain=domain,
+        subdomain=target,
+        vulnerability_id=finding.get("vulnerability_id") or template_id,
+        template_id=template_id,
+        finding=finding.get("finding") or finding.get("name") or "Vulnerability Discovered",
+        severity=str(finding.get("severity") or "info").lower(),
+        cve=finding.get("cve") or "",
+        cwe=finding.get("cwe") or "",
+        description=finding.get("description") or "",
+        remediation=finding.get("remediation") or "",
+        reference=finding.get("reference") or "",
+        source_tool="PythonScanner",
+    )
+    return True
+
+
+# ── Core scanner ───────────────────────────────────────────────────────────────
+
+def _run_phase_streaming(scan_id, scan, domain, targets, phase, phase_idx):
     """
-    Launches deep vulnerability scan thread for target.
-    Runs Python vulnerability scanner, Nuclei, and populates VulnerabilityResult objects.
+    Run a single Python vuln scanner phase, streaming results to DB.
+    Returns count of vulnerabilities found in this phase.
     """
-    def _run():
-        logger.info("Deep scan thread started for scan_id=%s, target=%s", scan_id, target)
-        update_live_state(scan_id, status="running", phase_idx=0)
-        
-        try:
-            from .models import AttackSurfaceScan, VulnerabilityResult
-            from .scanner.vulnerability_scanner import run_python_vuln_scanner, deduplicate_vulnerabilities
-            from reconnaissance.services.nuclei_scanner import run_nuclei
-            
-            scan = AttackSurfaceScan.objects.filter(id=scan_id).first()
-            if not scan:
-                return
+    found_count = 0
+    phase_name = phase["name"]
 
-            urls = live_urls or [f"https://{target}", f"http://{target}"]
-            total_vulns_found = 0
+    httpx_items = []
+    for t in (targets or [domain]):
+        url_str = t if isinstance(t, str) and t.startswith("http") else f"https://{t}"
+        httpx_items.append({"url": url_str, "headers": {}, "status_code": 0})
 
-            # Iterate through scan phases
-            for idx, phase in enumerate(SCAN_PHASES):
-                update_live_state(
-                    scan_id,
-                    phase_idx=idx,
-                    phase_id=phase["id"],
-                    phase_name=phase["name"],
-                    remaining_est_hours=max(0.01, 0.45 - (idx * 0.06))
-                )
-                
-                scan.vuln_scan_phase = f"running_{phase['id']}"
-                scan.save(update_fields=["vuln_scan_phase"])
+    logger.info("Starting Python scanner phase '%s' for scan %s on %d targets", phase_name, scan_id, len(httpx_items))
 
-                # Run Python scanner for baseline findings
-                httpx_items = [{"url": u, "headers": {}, "status_code": 200} for u in urls]
-                p_vulns = run_python_vuln_scanner(target, httpx_items)
-                
-                # Try Nuclei scan for current phase tags
-                n_vulns = []
+    try:
+        findings = run_python_vuln_scanner(domain, httpx_items)
+        for item in findings:
+            state = get_live_state(scan_id)
+            if state.get("stop"):
+                return found_count
+
+            # Filter items per phase if appropriate or save phase findings
+            saved = _save_vuln(scan, item, domain)
+            if saved:
+                found_count += 1
+                new_total = get_live_state(scan_id).get("total_found", 0) + 1
+                _set_live_state(scan_id, total_found=new_total)
                 try:
-                    n_vulns = run_nuclei(urls, tech_tags=[phase["id"]], http_timeout=5)
-                except Exception as ne:
-                    logger.debug("Nuclei scan for phase %s returned: %s", phase["id"], ne)
+                    scan.__class__.objects.filter(pk=scan.pk).update(nuclei_found=new_total)
+                except Exception:
+                    pass
+                logger.info("  [+] Found: %s (%s) → %s", item.get("finding"), item.get("severity"), item.get("subdomain"))
+    except Exception as e:
+        logger.exception("Error during Python scanner phase '%s': %s", phase_name, e)
 
-                combined = (p_vulns or []) + (n_vulns or [])
-                deduped = deduplicate_vulnerabilities(combined)
+    return found_count
 
-                for nv in deduped:
-                    target_url = nv.get("target", "")
-                    matched_host = nv.get("host") or nv.get("subdomain") or (urlparse(target_url).hostname if target_url else "") or target
-                    severity = (nv.get("severity") or "LOW").upper()
-                    cve = nv.get("cve", "")
-                    cwe = nv.get("cwe", "")
-                    finding = nv.get("finding") or nv.get("name", "Security Finding")
-                    description = nv.get("description", "Vulnerability identified during automated attack surface scan.")
-                    remediation = nv.get("remediation", "Apply vendor security patches and enforce secure configurations.")
-                    reference = nv.get("reference", "")
-                    template_id = nv.get("template_id", "")
-                    source_tool = nv.get("source_tool", "ASM Scanner")
-                    vuln_id = nv.get("vulnerability_id") or (f"CVE-{cve}" if cve else f"VULN-{template_id or phase['id']}")
 
-                    vr, created = VulnerabilityResult.objects.get_or_create(
-                        scan_id=scan_id,
-                        vulnerability_id=vuln_id,
-                        subdomain=matched_host,
-                        defaults={
-                            "domain": target,
-                            "severity": severity,
-                            "cve": cve or "-",
-                            "cwe": cwe or "-",
-                            "finding": finding,
-                            "description": description,
-                            "remediation": remediation,
-                            "reference": reference or "-",
-                            "template_id": template_id,
-                            "source_tool": source_tool,
-                            "org_id": scan.org_id,
-                        }
-                    )
-                    if created:
-                        total_vulns_found += 1
-                        update_live_state(scan_id, total_found=total_vulns_found)
+# ── Main orchestrator ──────────────────────────────────────────────────────────
 
-            # Check if any vulnerabilities exist, if not populate baseline security findings
-            existing_count = VulnerabilityResult.objects.filter(scan_id=scan_id).count()
-            if existing_count == 0:
-                baseline = [
-                    {
-                        "vulnerability_id": "MISCONF-HSTS-MISSING",
-                        "subdomain": target,
-                        "severity": "MEDIUM",
-                        "cve": "-",
-                        "cwe": "CWE-523",
-                        "finding": f"Missing Strict-Transport-Security (HSTS) Header on {target}",
-                        "description": "The HTTP Strict-Transport-Security header is not enforced on the target web server, allowing potential SSL stripping / MITM downgrade attacks.",
-                        "remediation": "Add 'Strict-Transport-Security: max-age=31536000; includeSubDomains' to all HTTPS response headers.",
-                        "reference": "https://cheatsheetseries.owasp.org/cheatsheets/HTTP_Strict_Transport_Security_Cheat_Sheet.html",
-                        "template_id": "headers/missing-hsts",
-                        "source_tool": "PythonScanner"
-                    },
-                    {
-                        "vulnerability_id": "MISCONF-XFO-MISSING",
-                        "subdomain": target,
-                        "severity": "LOW",
-                        "cve": "-",
-                        "cwe": "CWE-1021",
-                        "finding": f"Missing X-Frame-Options Header on {target}",
-                        "description": "The web application does not set an X-Frame-Options or Content-Security-Policy frame-ancestors directive, making it vulnerable to Clickjacking attacks.",
-                        "remediation": "Configure 'X-Frame-Options: SAMEORIGIN' or 'Content-Security-Policy: frame-ancestors \'self\'' on the web server.",
-                        "reference": "https://owasp.org/www-community/attacks/Clickjacking",
-                        "template_id": "headers/missing-xfo",
-                        "source_tool": "PythonScanner"
-                    },
-                    {
-                        "vulnerability_id": "MISCONF-CSP-MISSING",
-                        "subdomain": target,
-                        "severity": "LOW",
-                        "cve": "-",
-                        "cwe": "CWE-693",
-                        "finding": f"Missing Content-Security-Policy (CSP) Header on {target}",
-                        "description": "Content Security Policy (CSP) is an added layer of security that helps detect and mitigate Cross-Site Scripting (XSS) and data injection attacks.",
-                        "remediation": "Implement a strong Content-Security-Policy response header restricting script origins.",
-                        "reference": "https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP",
-                        "template_id": "headers/missing-csp",
-                        "source_tool": "PythonScanner"
-                    }
-                ]
-                for b in baseline:
-                    VulnerabilityResult.objects.get_or_create(
-                        scan_id=scan_id,
-                        vulnerability_id=b["vulnerability_id"],
-                        subdomain=b["subdomain"],
-                        defaults={
-                            "domain": target,
-                            "severity": b["severity"],
-                            "cve": b["cve"],
-                            "cwe": b["cwe"],
-                            "finding": b["finding"],
-                            "description": b["description"],
-                            "remediation": b["remediation"],
-                            "reference": b["reference"],
-                            "template_id": b["template_id"],
-                            "source_tool": b["source_tool"],
-                            "org_id": scan.org_id,
-                        }
-                    )
-                total_vulns_found = len(baseline)
+def run_deep_nuclei_scan(scan_id, domain, targets):
+    """
+    Main entry point for deep vulnerability scanning using pure Python engine.
+    Updates live state so UI progress remains active.
+    """
+    from .models import AttackSurfaceScan, VulnerabilityResult
 
-            # Complete scan state
-            scan.refresh_from_db()
-            scan.vuln_scan_phase = "complete"
-            scan.vulnerabilities_done = True
-            scan.save(update_fields=["vuln_scan_phase", "vulnerabilities_done"])
-            
-            update_live_state(
-                scan_id,
-                status="complete",
-                phase_idx=len(SCAN_PHASES) - 1,
-                remaining_est_hours=0,
-                total_found=VulnerabilityResult.objects.filter(scan_id=scan_id).count(),
-                completed_at=time.strftime("%Y-%m-%d %H:%M:%S")
-            )
-            logger.info("Deep scan completed for scan_id=%s, total_vulns=%d", scan_id, total_vulns_found)
+    globals()["VulnerabilityResult"] = VulnerabilityResult
 
-        except Exception as e:
-            logger.exception("Deep scan thread failed for scan_id=%s: %s", scan_id, e)
-            update_live_state(scan_id, status="error")
+    try:
+        scan = AttackSurfaceScan.objects.get(id=scan_id)
+    except AttackSurfaceScan.DoesNotExist:
+        logger.error("Deep scan: scan %s not found.", scan_id)
+        return
 
-    t = threading.Thread(target=_run, daemon=True)
+    total_phases = len(SCAN_PHASES)
+    total_found = 0
+
+    _set_live_state(scan_id,
+        phase_idx=0,
+        phase_name=SCAN_PHASES[0]["name"],
+        started_at=datetime.now().isoformat(),
+        total_found=0,
+        stop=False,
+        status="running",
+        total_phases=total_phases,
+    )
+
+    logger.info("=== Deep Python Vulnerability Scan STARTED for %s (scan_id=%s) ===", domain, scan_id)
+
+    for idx, phase in enumerate(SCAN_PHASES):
+        state = get_live_state(scan_id)
+        if state.get("stop"):
+            break
+
+        phase_start = time.time()
+        remaining_est_hours = sum(p["est_hours"] for p in SCAN_PHASES[idx:])
+
+        _set_live_state(scan_id,
+            phase_idx=idx,
+            phase_name=phase["name"],
+            phase_id=phase["id"],
+            phase_start=datetime.now().isoformat(),
+            remaining_phases=total_phases - idx,
+            remaining_est_hours=round(remaining_est_hours, 1),
+            next_phase_name=SCAN_PHASES[idx + 1]["name"] if idx + 1 < total_phases else "Complete",
+        )
+
+        logger.info("--- Phase %d/%d: %s ---", idx + 1, total_phases, phase["name"])
+
+        scan.vuln_scan_phase = f"phase_{idx+1}_of_{total_phases}_{phase['id']}"
+        scan.nuclei_phase = phase["name"]
+        scan.save(update_fields=["vuln_scan_phase", "nuclei_phase", "updated_at"])
+
+        phase_found = _run_phase_streaming(scan_id, scan, domain, targets, phase, idx)
+        total_found += phase_found
+
+        phase_elapsed = round((time.time() - phase_start) / 60, 1)
+        logger.info("Phase '%s' done in %.1f min | Found: %d | Total so far: %d",
+                    phase["name"], phase_elapsed, phase_found, total_found)
+
+        _set_live_state(scan_id, total_found=total_found)
+
+        if get_live_state(scan_id).get("stop"):
+            break
+
+    # Mark complete
+    scan.vuln_scan_phase = "complete"
+    scan.nuclei_phase = "Scan Complete"
+    scan.nuclei_found = total_found
+    scan.vulnerabilities_done = True
+    scan.save(update_fields=["vuln_scan_phase", "nuclei_phase", "nuclei_found", "vulnerabilities_done", "updated_at"])
+
+    _set_live_state(scan_id,
+        status="complete",
+        phase_name="Scan Complete",
+        total_found=total_found,
+        completed_at=datetime.now().isoformat(),
+    )
+
+    logger.info("=== Deep Python Vulnerability Scan COMPLETE for %s | Total found: %d ===", domain, total_found)
+
+
+def start_deep_scan_thread(scan_id, domain, targets):
+    """Launch the deep scan in a daemon thread."""
+    t = threading.Thread(
+        target=run_deep_nuclei_scan,
+        args=(scan_id, domain, targets),
+        daemon=True,
+        name=f"deep-nuclei-{scan_id}",
+    )
     t.start()
+    logger.info("Deep nuclei scan thread started for scan_id=%s", scan_id)
+    return t

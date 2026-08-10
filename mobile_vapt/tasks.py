@@ -109,11 +109,10 @@ def poll_virustotal_analysis(self, scan_id, analysis_id):
             suspicious = stats.get("suspicious", 0)
             undetected = stats.get("undetected", 0)
             
-            sec_score = max(10, 100 - (malicious * 15 + suspicious * 5)) if (malicious > 0 or suspicious > 0) else 95
-            scan_obj.score = str(sec_score)
-            scan_obj.status = "completed"
+            scan_obj.score = f"{malicious} Malicious / {suspicious} Suspicious / {undetected} Undetected"
+            scan_obj.status = "vt_completed"
             scan_obj.save(update_fields=['score', 'status'])
-            logger.info(f"Scan {scan_id} completed: score {scan_obj.score}/100 ({malicious} Malicious / {suspicious} Suspicious)")
+            logger.info(f"Scan {scan_id} completed: {scan_obj.score}")
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Error checking analysis {analysis_id}: {e}")

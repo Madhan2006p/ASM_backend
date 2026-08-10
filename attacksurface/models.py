@@ -74,9 +74,13 @@ class SubdomainResult(models.Model):
     vulnerabilities_count = models.IntegerField(default=0)
     waf = models.CharField(max_length=255, blank=True, null=True)
     cdn = models.CharField(max_length=255, blank=True, null=True)
+    location = models.CharField(max_length=255, blank=True, null=True)
+    screenshot_url = models.CharField(max_length=1000, blank=True, null=True)
     org_id = models.CharField(max_length=50, default="1")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    created_date = models.DateTimeField(null=True, blank=True)
+    updated_date = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["domain"]
@@ -99,8 +103,6 @@ class EndpointResult(models.Model):
     technologies = models.JSONField(default=list, blank=True)
     threat_count = models.IntegerField(default=0)
     method = models.CharField(max_length=10, default="GET")
-    auth_required = models.BooleanField(default=False)
-    source_tool = models.CharField(max_length=100, default="Crawler")
     org_id = models.CharField(max_length=50, default="1")
     discovered_at = models.DateTimeField(auto_now_add=True)
     last_scan = models.DateTimeField(auto_now=True)
@@ -245,6 +247,7 @@ class EmailSecurityResult(models.Model):
     mx = models.JSONField(default=list, blank=True)
     dkim_selector1 = models.JSONField(default=list, blank=True)
     dkim_default = models.JSONField(default=list, blank=True)
+    bimi = models.JSONField(default=list, blank=True)
     smtp_hosts = models.JSONField(default=list, blank=True)
     smtp_port_scan = models.JSONField(default=dict, blank=True)
     smtp_open_relay = models.JSONField(default=dict, blank=True)

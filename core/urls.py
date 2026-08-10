@@ -45,9 +45,6 @@ urlpatterns = [
     
     # Faraday Integration
     path('api/faraday/', include('findings.urls')),
-
-    # OWASP Top 10 Scanner
-    path('api/owasp-scanner/', include('owasp_scanner.urls')),
 ]
 
 if settings.DEBUG:

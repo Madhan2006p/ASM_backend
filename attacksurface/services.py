@@ -959,9 +959,13 @@ def run_nuclei(targets, tech_tags=None, http_timeout=5):
 def run_email_security(domain):
     result = {
         "domain": domain,
+        "root_txt": [],
         "spf": [],
         "dmarc": [],
         "mx": [],
+        "dkim_default": [],
+        "dkim_selector1": [],
+        "bimi": [],
         # smtp_starttls has three meaningful states:
         #   {"checked": False, ...}          → verification was not attempted / checkdmarc failed
         #   {"checked": True, "supported": False} → checked, but no MX host advertised STARTTLS
@@ -970,57 +974,51 @@ def run_email_security(domain):
     }
 
     try:
-        import checkdmarc
-        cd_res = checkdmarc.check_domains([domain])
-        
-        # Resolve cd_domain_res properly depending on format returned
-        if isinstance(cd_res, list) and len(cd_res) > 0:
-            cd_domain_res = cd_res[0]
-        elif isinstance(cd_res, dict):
-            cd_domain_res = cd_res.get(domain, cd_res)
-        else:
-            cd_domain_res = cd_res
-            
-        if isinstance(cd_domain_res, dict):
-            # Parse SPF
-            spf_data = cd_domain_res.get("spf", {})
-            spf_record = spf_data.get("record")
-            if spf_record:
-                result["spf"] = [spf_record]
-                result["root_txt"].append(spf_record)
-            
-            # Parse DMARC
-            dmarc_data = cd_domain_res.get("dmarc", {})
-            dmarc_record = dmarc_data.get("record")
-            if dmarc_record:
-                result["dmarc"] = [dmarc_record]
-                result["root_txt"].append(dmarc_record)
+        import subprocess
+        import json
+        import os
+        dss_path = os.path.expanduser('~/go/bin/dss')
+        if not os.path.exists(dss_path):
+            dss_path = "dss"
+
+        res = subprocess.run([dss_path, "scan", domain, "-f", "json"], capture_output=True, text=True, timeout=60)
+        stdout = res.stdout
+        json_start = stdout.find('[{"scanResult"')
+        if json_start != -1:
+            json_str = stdout[json_start:]
+            data = json.loads(json_str)
+            if data and isinstance(data, list):
+                scan_res = data[0].get("scanResult", {})
                 
-            # Parse MX and STARTTLS
-            mx_data = cd_domain_res.get("mx", {})
-            hosts = mx_data.get("hosts") or []
-            mx_records = []
-            smtp_hosts = []
-            starttls_supported = False
-            
-            for host in hosts:
-                pref = host.get("preference", 10)
-                hostname = host.get("hostname", "")
-                if hostname:
-                    mx_records.append(f"{pref} {hostname}")
-                    smtp_hosts.append(hostname)
-                if host.get("starttls") or host.get("tls"):
-                    starttls_supported = True
-            
-            result["mx"] = mx_records
-            result["smtp_hosts"] = smtp_hosts
-            result["smtp_starttls"] = {
-                "supported": starttls_supported,
-                "checked": True,
-            }
+                spf_record = scan_res.get("spf")
+                if spf_record:
+                    result["spf"] = [spf_record]
+                    result["root_txt"].append(spf_record)
+                
+                dmarc_record = scan_res.get("dmarc")
+                if dmarc_record:
+                    result["dmarc"] = [dmarc_record]
+                    result["root_txt"].append(dmarc_record)
+                
+                mx_records = scan_res.get("mx", [])
+                result["mx"] = [f"10 {mx}" for mx in mx_records]
+                result["smtp_hosts"] = mx_records
+                
+                dkim_record = scan_res.get("dkim")
+                if dkim_record:
+                    result["dkim_default"] = [dkim_record]
+                    
+                bimi_record = scan_res.get("bimi")
+                if bimi_record:
+                    result["bimi"] = [bimi_record]
+                
+                result["smtp_starttls"] = {
+                    "supported": True if mx_records else False,
+                    "checked": True,
+                }
             
     except Exception as e:
-        print(f"checkdmarc failed in attack surface scanner for {domain}: {e}")
+        print(f"domain-security-scanner failed in attack surface scanner for {domain}: {e}")
         # Mark STARTTLS as verification-failed so the frontend can distinguish
         # this from a successful check that found no STARTTLS support.
         result["smtp_starttls"] = {
@@ -1246,14 +1244,31 @@ def run_full_scan(scan):
             print("Failed to auto-start Spiderfoot scan:", e)
 
         # ── Phase 1: Subdomain Discovery ──────────────────────────────────────
+        current_time = timezone.now()
+
         subdomains = run_subfinder(target)
         if not subdomains:
             subdomains = [target]
 
         for sub in subdomains:
+            previous_subs = SubdomainResult.objects.filter(scan__target=target, domain=sub).exclude(scan=scan).order_by('id')
+            
+            if not previous_subs.exists():
+                created_val = current_time
+                updated_val = None
+            else:
+                prev_sub = previous_subs.last()
+                created_val = prev_sub.created_date
+                updated_val = current_time
+
             SubdomainResult.objects.get_or_create(
                 scan=scan, domain=sub,
-                defaults={"org_id": org_id, "status": "Active"},
+                defaults={
+                    "org_id": org_id, 
+                    "status": "Active",
+                    "created_date": created_val,
+                    "updated_date": updated_val
+                },
             )
 
         # Immediate Subdomain Fallback / Enrichment
@@ -1261,9 +1276,25 @@ def run_full_scan(scan):
         if sub_count <= 2:
             fallbacks = ["www", "api", "mail", "admin", "dev", "vpn"]
             for f in fallbacks:
+                fallback_domain = f"{f}.{target}"
+                previous_subs = SubdomainResult.objects.filter(scan__target=target, domain=fallback_domain).exclude(scan=scan).order_by('id')
+                
+                if not previous_subs.exists():
+                    created_val = current_time
+                    updated_val = None
+                else:
+                    prev_sub = previous_subs.last()
+                    created_val = prev_sub.created_date
+                    updated_val = current_time
+
                 SubdomainResult.objects.get_or_create(
-                    scan=scan, domain=f"{f}.{target}",
-                    defaults={"org_id": org_id, "status": "Active"},
+                    scan=scan, domain=fallback_domain,
+                    defaults={
+                        "org_id": org_id, 
+                        "status": "Active",
+                        "created_date": created_val,
+                        "updated_date": updated_val
+                    },
                 )
             # Re-read subdomains list
             subdomains = [r.domain for r in SubdomainResult.objects.filter(scan=scan)]
@@ -1444,19 +1475,16 @@ def run_full_scan(scan):
             hn = urlparse(url).hostname or ""
             endpoint_covered.add(hn)
             techs = combined_tech_map.get(hn, data.get("tech", []))
-            st = data.get("status_code", 200)
             EndpointResult.objects.get_or_create(
                 scan=scan, http_url=url,
                 defaults={
                     "subdomain_name": hn,
-                    "http_status": st,
+                    "http_status": data.get("status_code"),
                     "content_type": data.get("content_type"),
                     "content_length": data.get("content_length"),
                     "title": data.get("title", ""),
                     "is_alive": True,
                     "technologies": techs,
-                    "auth_required": st in (401, 403),
-                    "source_tool": "Crawler",
                     "org_id": org_id,
                 },
             )
@@ -1494,8 +1522,6 @@ def run_full_scan(scan):
                         "title": ep["title"],
                         "is_alive": True,
                         "technologies": techs,
-                        "auth_required": ep["status"] in (401, 403),
-                        "source_tool": "Crawler",
                         "org_id": org_id
                     }
                 )
@@ -1771,7 +1797,7 @@ def run_full_scan(scan):
                             "cwe": v.get("cwe", "CWE-326"),
                             "finding": v.get("finding", ""),
                             "template_id": v.get("template_id", "ssl/cipher-suite"),
-                            "source_tool": v.get("source_tool", "Nmap (ssl-enum-ciphers)"),
+                            "source_tool": "PythonScanner",
                             "description": v.get("description", ""),
                             "remediation": v.get("remediation", ""),
                             "org_id": org_id,

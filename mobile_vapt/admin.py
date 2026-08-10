@@ -20,21 +20,9 @@ class MobileScanAdmin(admin.ModelAdmin):
         if not obj.file_name and obj.apk_file:
             import os
             obj.file_name = os.path.basename(obj.apk_file.name)
-        if not obj.scan_hash:
-            import hashlib, time, uuid
-            if obj.apk_file:
-                try:
-                    obj.apk_file.seek(0)
-                    content = obj.apk_file.read()
-                    obj.apk_file.seek(0)
-                    h = hashlib.md5(content).hexdigest()
-                    if MobileScan.objects.filter(scan_hash=h).exclude(id=obj.id).exists():
-                        h = hashlib.md5(f"{h}_{time.time()}_{uuid.uuid4()}".encode()).hexdigest()
-                    obj.scan_hash = h
-                except Exception:
-                    obj.scan_hash = hashlib.md5(f"{obj.apk_file.name}_{time.time()}_{uuid.uuid4()}".encode()).hexdigest()
-            else:
-                obj.scan_hash = hashlib.md5(f"{obj.file_name or 'scan'}_{time.time()}_{uuid.uuid4()}".encode()).hexdigest()
+        if not obj.scan_hash and obj.apk_file:
+            import hashlib
+            obj.scan_hash = hashlib.md5(obj.apk_file.name.encode()).hexdigest()
         
         super().save_model(request, obj, form, change)
         
