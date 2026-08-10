@@ -18,9 +18,8 @@ from .tasks import (
     run_dirsearch, run_nuclei_vuln_scan, run_wappalyzer_scan, run_ssl_check,
     run_nmap_scan, run_httpx_tech, run_inql, run_gau, run_waybackurls,
     run_swagger, run_soap_wsdl, run_grpcurl, run_full_workflow, run_wapiti,
-    run_detection_scan, run_periodic_monitor
+    run_detection_scan, run_periodic_monitor, run_arjun_scan
 )
-from fuzzing.tasks import run_arjun
 
 SCAN_TASK_MAP = {
     'DIRSEARCH': run_dirsearch,
@@ -31,7 +30,7 @@ SCAN_TASK_MAP = {
     'SWAGGER': run_swagger,
     'SOAP_WSDL': run_soap_wsdl,
     'GRPCURL': run_grpcurl,
-    'ARJUN': run_arjun,
+    'ARJUN': run_arjun_scan,
     'NUCLEI': run_nuclei_vuln_scan,
     'NMAP': run_nmap_scan,
     'SSL_CHECK': run_ssl_check,

@@ -26,6 +26,45 @@ def seed():
     else:
         print(f"Using existing superuser: {user.username}")
 
+    # 1b. Create a default regular tenant user
+    from authentication.models import Organization, OrganizationMembership, UserProfile
+    tenant_username = 'user'
+    tenant_email = 'user@example.com'
+    tenant_password = 'changeme'
+    tenant_user = User.objects.filter(username=tenant_username).first()
+    if not tenant_user:
+        tenant_user = User.objects.create_user(
+            username=tenant_username,
+            email=tenant_email,
+            password=tenant_password
+        )
+        print("Tenant user created.")
+    else:
+        tenant_user.set_password(tenant_password)
+        tenant_user.save()
+        print(f"Using existing tenant user: {tenant_user.username}")
+
+    # Ensure Default Org exists and link user
+    org, _ = Organization.objects.get_or_create(
+        org_id="1",
+        defaults={"name": "Default Org"}
+    )
+    OrganizationMembership.objects.get_or_create(
+        user=tenant_user,
+        organization=org,
+        defaults={"role": "admin"}
+    )
+
+    # Ensure UserProfile exists with all features unlocked
+    profile, _ = UserProfile.objects.get_or_create(
+        user=tenant_user,
+        defaults={"features": "1,2,3,4,5,6"}
+    )
+    if profile.features != "1,2,3,4,5,6":
+        profile.features = "1,2,3,4,5,6"
+        profile.save()
+        print("Updated tenant user profile features.")
+
     # 2. Create Target
     target, created = Target.objects.get_or_create(
         domain='example.com',

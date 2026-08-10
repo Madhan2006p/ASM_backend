@@ -23,7 +23,7 @@ SCAN_TASK_MAP = {
     'SWAGGER': 'scans.tasks.run_swagger',
     'SOAP_WSDL': 'scans.tasks.run_soap_wsdl',
     'GRPCURL': 'scans.tasks.run_grpcurl',
-    'ARJUN': 'fuzzing.tasks.run_arjun',
+    'ARJUN': 'scans.tasks.run_arjun_scan',
     'NUCLEI': 'scans.tasks.run_nuclei_vuln_scan',
     'NMAP': 'scans.tasks.run_nmap_scan',
     'SSL_CHECK': 'scans.tasks.run_ssl_check',
@@ -366,73 +366,120 @@ def run_ssl_check(self, scan_id):
     scan.save()
 
     target_domain = scan.target.domain
-    output_file = settings.SCAN_OUTPUT_DIR / f'testssl_{scan_id}.json'
-    testssl_path = getattr(settings, 'TESTSSL_PATH', 'testssl.sh')
-
-    testssl_env = {**os.environ, "TESTSSL_INSTALL_DIR": str(Path(testssl_path).resolve().parent)} if testssl_path else None
-
-    command = [
-        testssl_path,
-        '--jsonfile-pretty', str(output_file),
-        target_domain
-    ]
+    import shutil
+    has_testssl = testssl_path and shutil.which(testssl_path) is not None
 
     try:
-        subprocess.run(command, capture_output=True, text=True, timeout=300, env=testssl_env)
+        if has_testssl:
+            testssl_env = {**os.environ, "TESTSSL_INSTALL_DIR": str(Path(testssl_path).resolve().parent)} if testssl_path else None
+            command = [
+                testssl_path,
+                '--jsonfile-pretty', str(output_file),
+                target_domain
+            ]
+            subprocess.run(command, capture_output=True, text=True, timeout=300, env=testssl_env)
 
-        if output_file.exists():
-            with open(output_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            if output_file.exists():
+                with open(output_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
 
-            if isinstance(data, list):
-                host_info = data[0] if data else {}
-            else:
-                host_info = data
+                if isinstance(data, list):
+                    host_info = data[0] if data else {}
+                else:
+                    host_info = data
 
-            host = host_info.get('Host', target_domain)
-            port = host_info.get('Port', 443)
-            grade = host_info.get('grade', None) or host_info.get('Grade', None)
-            cert_info = json.dumps({
-                k: host_info.get(k) for k in
-                ['cert_chain_issues', 'certificate_notBefore', 'certificate_notAfter',
-                 'issuer', 'subjectAltNames', 'key_size', 'signature_algo']
-                if k in host_info
-            }, indent=2)
-
-            protocols = host_info.get('protocols', None) or host_info.get('Protocols', None)
-            if protocols is None:
-                protocols = json.dumps({
-                    k: host_info.get(k) for k in host_info
-                    if any(p in k.lower() for p in ['tls', 'ssl', 'proto'])
+                host = host_info.get('Host', target_domain)
+                port = host_info.get('Port', 443)
+                grade = host_info.get('grade', None) or host_info.get('Grade', None)
+                cert_info = json.dumps({
+                    k: host_info.get(k) for k in
+                    ['cert_chain_issues', 'certificate_notBefore', 'certificate_notAfter',
+                     'issuer', 'subjectAltNames', 'key_size', 'signature_algo']
+                    if k in host_info
                 }, indent=2)
 
-            vulns = host_info.get('vulnerabilities', None) or host_info.get('Vulnerabilities', None)
-            if vulns is None:
-                vuln_keys = [k for k in host_info
-                            if any(v in k.lower() for v in ['vuln', 'cve', 'weak', 'beast', 'poodle', 'heartbleed', 'freak'])]
-                vulns = json.dumps({k: host_info.get(k) for k in vuln_keys}, indent=2) if vuln_keys else None
+                protocols = host_info.get('protocols', None) or host_info.get('Protocols', None)
+                if protocols is None:
+                    protocols = json.dumps({
+                        k: host_info.get(k) for k in host_info
+                        if any(p in k.lower() for p in ['tls', 'ssl', 'proto'])
+                    }, indent=2)
 
-            cipher = host_info.get('cipher_strength', None) or host_info.get('CipherStrength', None)
+                vulns = host_info.get('vulnerabilities', None) or host_info.get('Vulnerabilities', None)
+                if vulns is None:
+                    vuln_keys = [k for k in host_info
+                                if any(v in k.lower() for v in ['vuln', 'cve', 'weak', 'beast', 'poodle', 'heartbleed', 'freak'])]
+                    vulns = json.dumps({k: host_info.get(k) for k in vuln_keys}, indent=2) if vuln_keys else None
 
-            from .models import SSLResult
-            SSLResult.objects.create(
-                scan=scan,
-                target=scan.target,
-                host=host,
-                port=port,
-                grade=grade,
-                certificate_info=cert_info,
-                protocols=str(protocols) if protocols else None,
-                cipher_strength=cipher,
-                vulnerabilities=str(vulns) if vulns else None,
-                raw_json=json.dumps(host_info, indent=2)
-            )
+                cipher = host_info.get('cipher_strength', None) or host_info.get('CipherStrength', None)
 
-            scan.status = 'COMPLETED'
-            scan.result_file = str(output_file)
+                from .models import SSLResult
+                SSLResult.objects.create(
+                    scan=scan,
+                    target=scan.target,
+                    host=host,
+                    port=port,
+                    grade=grade,
+                    certificate_info=cert_info,
+                    protocols=str(protocols) if protocols else None,
+                    cipher_strength=cipher,
+                    vulnerabilities=str(vulns) if vulns else None,
+                    raw_json=json.dumps(host_info, indent=2)
+                )
+
+                scan.status = 'COMPLETED'
+                scan.result_file = str(output_file)
+            else:
+                scan.status = 'FAILED'
+                scan.result_file = 'testssl.sh did not produce output file'
         else:
-            scan.status = 'FAILED'
-            scan.result_file = 'testssl.sh did not produce output file'
+            logger.info("testssl.sh not found, running python native SSL check for %s", target_domain)
+            import ssl
+            import socket
+            
+            # Resolve IP address
+            try:
+                ip_addr = socket.gethostbyname(target_domain)
+            except Exception:
+                ip_addr = target_domain
+                
+            context = ssl.create_default_context()
+            try:
+                with socket.create_connection((target_domain, 443), timeout=10) as sock:
+                    with context.wrap_socket(sock, server_hostname=target_domain) as ssock:
+                        cert = ssock.getpeercert()
+                        cipher_info = ssock.cipher()
+                        tls_version = ssock.version()
+                        
+                        from attacksurface.scanner.ssl_scanner import _compute_ssl_grade, _cert_issuer_str
+                        grade = _compute_ssl_grade(cert, tls_version)
+                        
+                        cert_info_dict = {
+                            "certificate_notBefore": cert.get("notBefore", ""),
+                            "certificate_notAfter": cert.get("notAfter", ""),
+                            "issuer": _cert_issuer_str(cert.get("issuer", [])),
+                            "subjectAltNames": str(cert.get("subjectAltName", [])),
+                            "signature_algo": cert.get("signatureAlgorithm", "Unknown"),
+                        }
+                        
+                        from .models import SSLResult
+                        SSLResult.objects.create(
+                            scan=scan,
+                            target=scan.target,
+                            host=target_domain,
+                            port=443,
+                            grade=grade,
+                            certificate_info=json.dumps(cert_info_dict, indent=2),
+                            protocols=tls_version,
+                            cipher_strength=cipher_info[0] if cipher_info else "Unknown",
+                            vulnerabilities=None,
+                            raw_json=json.dumps(cert, indent=2)
+                        )
+                        
+                        scan.status = 'COMPLETED'
+                        scan.result_file = 'Python native SSL scan (testssl.sh fallback)'
+            except Exception as native_e:
+                raise FileNotFoundError(f"testssl.sh not found at '{testssl_path}' and native SSL check failed: {native_e}")
     except subprocess.TimeoutExpired:
         scan.status = 'FAILED'
         scan.result_file = 'SSL check timed out (300s)'
@@ -1066,3 +1113,74 @@ def run_wapiti(self, scan_id):
         scan.completed_at = timezone.now()
         scan.save()
 
+@shared_task(bind=True)
+def run_arjun_scan(self, scan_id):
+    """
+    Runs Arjun parameter discovery on target domain and saves the discovered
+    parameters as Vulnerability entries under the source_tool 'Arjun'.
+    """
+    scan = Scan.objects.get(id=scan_id)
+    scan.status = 'RUNNING'
+    scan.celery_task_id = self.request.id
+    scan.save()
+
+    target_domain = scan.target.domain
+    target_url = f"https://{target_domain}"
+    output_file = settings.SCAN_OUTPUT_DIR / f'arjun_{scan_id}.json'
+
+    # Prepare Arjun command
+    command = [
+        settings.ARJUN_PATH,
+        '-u', target_url,
+        '-oT', str(output_file),
+    ]
+
+    try:
+        subprocess.run(command, capture_output=True, text=True, timeout=300)
+
+        params = []
+        if output_file.exists():
+            with open(output_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            # Arjun json output structure: {"https://target": {"params": ["p1", "p2"]}}
+            params = data.get(target_url, {}).get('params', [])
+            if not params:
+                for url_key in data:
+                    entry = data[url_key]
+                    if isinstance(entry, dict) and 'params' in entry:
+                        params = entry['params']
+                        break
+
+            for param in params:
+                param_name = param if isinstance(param, str) else param.get('name', str(param))
+                Vulnerability.objects.get_or_create(
+                    target=scan.target,
+                    title=f"Discovered Parameter: {param_name}",
+                    defaults={
+                        'severity': 'INFO',
+                        'description': f"HTTP parameter '{param_name}' discovered via Arjun parameter fuzzing on {target_url}.",
+                        'remediation': "Verify that input validation, type casting, and sanitization are applied to this parameter to prevent parameter injection or fuzzing vulnerability.",
+                        'source_tool': 'Arjun',
+                    }
+                )
+
+            try:
+                output_file.unlink()
+            except OSError:
+                pass
+
+        scan.status = 'COMPLETED'
+        scan.result_file = f"Arjun scan completed. Discovered {len(params)} parameters."
+    except subprocess.TimeoutExpired:
+        scan.status = 'FAILED'
+        scan.result_file = 'Arjun scan timed out (300s)'
+    except FileNotFoundError:
+        scan.status = 'FAILED'
+        scan.result_file = f'Arjun not found at "{settings.ARJUN_PATH}"'
+    except Exception as e:
+        scan.status = 'FAILED'
+        scan.result_file = str(e)
+    finally:
+        scan.completed_at = timezone.now()
+        scan.save()

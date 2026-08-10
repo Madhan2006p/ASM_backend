@@ -17,6 +17,7 @@ from .services.wapiti_scanner import run_wapiti
 from .services.waybackurls_scanner import run_waybackurls
 from .services.whatweb_scanner import run_whatweb_scan
 from .services.email_security_scanner import run_email_security_scan
+from .services.arjun_scanner import run_arjun
 
 
 @shared_task(bind=True)
@@ -37,6 +38,7 @@ def run_scheduled_recon_scan(self, target="kongu.ac.in"):
         "wappalyzer": executor.submit(run_wappalyzer, target),
         "whatweb": executor.submit(run_whatweb_scan, target),
         "email_security": executor.submit(run_email_security_scan, target),
+        "arjun": executor.submit(run_arjun, target),
     }
 
     results = {}

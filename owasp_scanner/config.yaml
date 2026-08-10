@@ -1,0 +1,186 @@
+# ============================================================
+# OWASP Top 10 Scanner - Configuration File
+# ============================================================
+
+scanner:
+  name: "ASM OWASP Scanner"
+  version: "1.0.0"
+  description: "Production-ready OWASP Top 10 vulnerability scanner"
+
+# ── Concurrency & Performance ───────────────────────────────
+performance:
+  max_concurrent_requests: 25
+  max_concurrent_scans: 5
+  request_timeout: 10
+  connect_timeout: 5
+  retry_attempts: 2
+  retry_backoff: 1.5
+  rate_limit_delay: 0.05      # 50ms between requests
+  max_urls_to_crawl: 50
+  max_form_inputs: 20
+  max_depth: 2                # crawler depth
+
+# ── HTTP Settings ────────────────────────────────────────────
+http:
+  user_agent: "Mozilla/5.0 (compatible; ASM-Scanner/1.0)"
+  follow_redirects: true
+  max_redirects: 10
+  verify_ssl: false
+  default_headers:
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    Accept-Language: "en-US,en;q=0.5"
+    Accept-Encoding: "gzip, deflate"
+    Connection: "keep-alive"
+
+# ── Discovery Settings ───────────────────────────────────────
+discovery:
+  crawl_js: true
+  crawl_robots: true
+  crawl_sitemap: true
+  discover_apis: true
+  discover_forms: true
+  discover_params: true
+  wordlist_dirs:
+    - "common.txt"
+    - "api-endpoints.txt"
+  file_extensions:
+    - php
+    - html
+    - js
+    - json
+    - xml
+    - txt
+    - bak
+    - conf
+    - env
+
+# ── Tool Integrations ─────────────────────────────────────────
+tools:
+  nmap:
+    enabled: true
+    timeout: 30
+    ports: "80,443,8080,8443,8000"
+  nuclei:
+    enabled: true
+    timeout: 45
+    severity: "low,medium,high,critical"
+    templates:
+      - "cves/"
+      - "misconfiguration/"
+      - "vulnerabilities/"
+  testssl:
+    enabled: false
+    timeout: 30
+  httpx:
+    enabled: true
+    timeout: 15
+  katana:
+    enabled: false
+    timeout: 30
+  gau:
+    enabled: true
+    timeout: 15
+  waybackurls:
+    enabled: true
+    timeout: 15
+  paramspider:
+    enabled: false
+    timeout: 30
+  arjun:
+    enabled: false
+    timeout: 30
+  dirsearch:
+    enabled: false
+    timeout: 30
+  nikto:
+    enabled: false
+    timeout: 60
+  whatweb:
+    enabled: true
+    timeout: 15
+  wafw00f:
+    enabled: true
+    timeout: 15
+  subfinder:
+    enabled: false
+    timeout: 30
+
+# ── CVE Mapping ───────────────────────────────────────────────
+cve_mapping:
+  nvd_api_url: "https://services.nvd.nist.gov/rest/json/cves/2.0"
+  nvd_api_key: ""          # Set via environment variable NVD_API_KEY
+  cisa_kev_url: "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+  osv_api_url: "https://api.osv.dev/v1/query"
+  epss_api_url: "https://api.first.org/data/v1/epss"
+  cache_ttl_hours: 24
+  enable_cpe_matching: true
+
+# ── Detection Thresholds ──────────────────────────────────────
+detection:
+  # Minimum number of evidence points to report a vuln
+  sqli_confirmation_threshold: 2
+  ssrf_confirmation_threshold: 2
+  xss_confirmation_threshold: 2
+  enable_active_scanning: true
+  enable_timing_attacks: true
+  timing_threshold_ms: 4000   # milliseconds extra delay = TimeBased
+  blind_canary_url: ""        # Optional: interactsh URL for blind detection
+
+# ── Payload Settings ──────────────────────────────────────────
+payloads:
+  sqli_quick:
+    - "'"
+    - "\""
+    - "' OR '1'='1"
+    - "' OR 1=1--"
+    - "1; SELECT SLEEP(5)--"
+    - "1' AND SLEEP(5)--"
+    - "'; WAITFOR DELAY '0:0:5'--"
+  cmd_injection:
+    - "; id"
+    - "| id"
+    - "; sleep 5"
+    - "| sleep 5"
+    - "`id`"
+    - "$(id)"
+  ssti:
+    - "{{7*7}}"
+    - "${7*7}"
+    - "<%= 7 * 7 %>"
+    - "{{config}}"
+  xxe:
+    - '<?xml version="1.0"?><!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>'
+  ssrf_common:
+    - "http://169.254.169.254/latest/meta-data/"
+    - "http://metadata.google.internal/computeMetadata/v1/"
+    - "http://localhost"
+    - "http://127.0.0.1"
+    - "http://[::1]"
+
+# ── Reporting ─────────────────────────────────────────────────
+reporting:
+  include_request_response: true
+  include_evidence: true
+  include_remediation: true
+  include_business_impact: true
+  output_formats:
+    - json
+    - csv
+    - html
+    - pdf
+  executive_summary: true
+  min_severity_to_report: "INFO"  # INFO, LOW, MEDIUM, HIGH, CRITICAL
+
+# ── Severity Mapping ──────────────────────────────────────────
+severity:
+  cvss_critical: 9.0
+  cvss_high: 7.0
+  cvss_medium: 4.0
+  cvss_low: 0.1
+
+# ── Logging ───────────────────────────────────────────────────
+logging:
+  level: "INFO"
+  log_requests: false
+  log_responses: false
+  log_file: "owasp_scanner.log"
