@@ -35,7 +35,7 @@ def _resolve_spiderfoot():
     Returns a (python_bin, sf_path) tuple, or (None, None) when Spiderfoot
     cannot be located. Resolution order:
       1. SPIDERFOOT_PYTHON / SPIDERFOOT_SF_PATH environment variables
-      2. ~/spiderfoot/ (venv + sf.py)  — typical local install
+      2. ~/spiderfoot/ (venv + sf.py)  ΓÇö typical local install
       3. Legacy path used by the original developer machine
       4. A `spiderfoot` executable on PATH
     """
@@ -64,7 +64,7 @@ def _find_scan_instance_id(scan, db_path):
     Find Spiderfoot's internal scan instance id for a Django scan.
 
     The instance is created inside Spiderfoot's own database when the scan
-    starts, so it may not exist yet on the first call — callers should retry.
+    starts, so it may not exist yet on the first call ΓÇö callers should retry.
     """
     if not db_path or not os.path.isfile(db_path):
         return None

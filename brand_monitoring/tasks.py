@@ -70,7 +70,7 @@ def _generate_simulated_stats(domain):
     import hashlib
     h = int(hashlib.md5(domain.encode()).hexdigest(), 16)
     
-    # ── Real Fallback Check: URLHaus API (Keyless, free reputation database) ────
+    # ΓöÇΓöÇ Real Fallback Check: URLHaus API (Keyless, free reputation database) ΓöÇΓöÇΓöÇΓöÇ
     malicious = 0
     tags = ["clean", "verified"]
     is_malware_host = False
@@ -861,7 +861,7 @@ def _run_gowitness(domain):
     Capture a screenshot of the given domain.
     Priority:
       1. Local gowitness binary (if installed)
-      2. Microlink JSON API → resolves actual CDN image URL
+      2. Microlink JSON API ΓåÆ resolves actual CDN image URL
       3. thum.io fallback (direct <img> compatible URL, no API key needed)
     """
     # 1. Try local gowitness
@@ -876,7 +876,7 @@ def _run_gowitness(domain):
     except Exception:
         pass
 
-    # 2. Try Microlink JSON API — returns JSON with data.screenshot.url
+    # 2. Try Microlink JSON API ΓÇö returns JSON with data.screenshot.url
     try:
         api_url = f"https://api.microlink.io/?url=https%3A%2F%2F{domain}&screenshot=true&meta=false&embed=screenshot.url"
         # Use the JSON endpoint (no &embed) to get the image URL from JSON
@@ -893,7 +893,7 @@ def _run_gowitness(domain):
     except Exception:
         pass
 
-    # 3. Fallback: thum.io — returns screenshot image directly, no API key needed
+    # 3. Fallback: thum.io ΓÇö returns screenshot image directly, no API key needed
     import urllib.parse
     encoded = urllib.parse.quote(f"https://{domain}", safe="")
     return f"https://image.thum.io/get/width/600/crop/600/{encoded}"

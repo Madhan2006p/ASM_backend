@@ -76,7 +76,10 @@ def _wait_for_mobsf(timeout: int = HEALTH_TIMEOUT) -> bool:
         attempt += 1
         try:
             resp = _requests.get(url, headers=headers, timeout=4)
-            if resp.status_code == 200:
+            # Any 2xx/3xx response means the HTTP server is up. MobSF's root
+            # page redirects (302) to its login view, so a bare 200 check would
+            # never succeed and the wait would always run to the full timeout.
+            if 200 <= resp.status_code < 400:
                 logger.info(f"[MobSF Docker] MobSF is ready ✓ (attempt {attempt})")
                 return True
         except Exception:
