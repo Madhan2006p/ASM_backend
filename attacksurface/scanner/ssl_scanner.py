@@ -15,6 +15,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# SSL/TLS findings map to OWASP A02 (Cryptographic Failures) so they render
+# with the A02 badge in the main Vulnerabilities table.
+OWASP_A02 = {"owasp_category": "A02:2021 - Cryptographic Failures", "owasp_rank": 2}
+
 # Cipher risk classification rules (matching nmap --script ssl-enum-ciphers and OWASP recommendations)
 WEAK_CIPHER_PATTERNS = {
     "NULL": ("CRITICAL", "SSL-NULL-CIPHER", "CVE-2022-0001", "CWE-311", "Null Cipher Suite Supported", "Enables unencrypted plaintext communication over SSL/TLS."),
@@ -122,6 +126,7 @@ def _add_protocol_attack(results, host, port, attack_key, supported_hint=""):
         "source_tool": "PythonScanner",
         "description": meta["description"],
         "remediation": meta["remediation"],
+        **OWASP_A02,
     })
     penalty = {"CRITICAL": 40, "HIGH": 25, "MEDIUM": 15}.get(meta["severity"], 10)
     results["attack_grade_penalty"] = results.get("attack_grade_penalty", 0) + penalty
@@ -344,7 +349,8 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "template_id": "ssl/untrusted-certificate",
             "source_tool": "PythonScanner",
             "description": "The target SSL certificate is self-signed or issued by an untrusted CA.",
-            "remediation": "Install a valid SSL certificate issued by a trusted Certificate Authority."
+            "remediation": "Install a valid SSL certificate issued by a trusted Certificate Authority.",
+            **OWASP_A02,
         })
     except Exception:
         pass
@@ -369,7 +375,8 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
                     "template_id": f"ssl/weak-cipher/{pat.lower()}",
                     "source_tool": "PythonScanner",
                     "description": desc,
-                    "remediation": "Disable weak and legacy cipher suites in web server configuration."
+                    "remediation": "Disable weak and legacy cipher suites in web server configuration.",
+                    **OWASP_A02,
                 })
                 if sev == "CRITICAL":
                     grade_penalty += 40
@@ -392,7 +399,8 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "template_id": "ssl/deprecated-tls10",
             "source_tool": "PythonScanner",
             "description": "TLS 1.0 is deprecated (RFC 8996) and vulnerable to BEAST attacks.",
-            "remediation": "Disable TLS 1.0 and enforce TLS 1.2 or TLS 1.3."
+            "remediation": "Disable TLS 1.0 and enforce TLS 1.2 or TLS 1.3.",
+            **OWASP_A02,
         })
         # BEAST: TLS 1.0 CBC predictable-IV attack
         _add_protocol_attack(results, host, port, "BEAST", "TLS 1.0 enabled")
@@ -410,7 +418,8 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "template_id": "ssl/deprecated-tls11",
             "source_tool": "PythonScanner",
             "description": "TLS 1.1 is deprecated (RFC 8996).",
-            "remediation": "Disable TLS 1.1 and enforce TLS 1.2 or TLS 1.3."
+            "remediation": "Disable TLS 1.1 and enforce TLS 1.2 or TLS 1.3.",
+            **OWASP_A02,
         })
 
     # POODLE: SSL 3.0 support
@@ -451,7 +460,8 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "template_id": "ssl/openssl-heartbleed",
             "source_tool": "PythonScanner",
             "description": "The server is vulnerable to Heartbleed, allowing remote memory disclosure of secret keys and session tokens.",
-            "remediation": "Upgrade OpenSSL to 1.0.1g or later and re-issue SSL certificates."
+            "remediation": "Upgrade OpenSSL to 1.0.1g or later and re-issue SSL certificates.",
+            **OWASP_A02,
         })
 
     # Compute SSL Grade

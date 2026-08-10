@@ -1863,6 +1863,8 @@ def run_full_scan(scan):
                             "source_tool": "PythonScanner",
                             "description": v.get("description", ""),
                             "remediation": v.get("remediation", ""),
+                            "owasp_category": v.get("owasp_category", ""),
+                            "owasp_rank": v.get("owasp_rank", 0),
                             "org_id": org_id,
                         }
                     )

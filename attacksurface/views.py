@@ -243,20 +243,6 @@ class SSLResultListView(AttackSurfaceBaseView):
     model = SSLResult
     required_module = "ssl_certificates"
 
-    def get_queryset(self):
-        from django.db.models import Prefetch, Q
-
-        qs = super().get_queryset()
-        # Preload SSL-related findings once per request (avoids N+1 queries in
-        # SSLResultSerializer.get_findings).
-        scan_ids = list(qs.values_list("scan_id", flat=True).distinct())
-        ssl_vulns = VulnerabilityResult.objects.filter(scan_id__in=scan_ids).filter(
-            Q(template_id__startswith="ssl/")
-            | Q(vulnerability_id__startswith="SSL-")
-            | Q(vulnerability_id__startswith="OPENSSL-")
-        )
-        return qs.prefetch_related(Prefetch("scan__vulnerabilities", queryset=ssl_vulns))
-
 
 class EmailSecurityListView(AttackSurfaceBaseView):
     serializer_class = EmailSecurityResultSerializer

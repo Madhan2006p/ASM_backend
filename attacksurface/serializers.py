@@ -153,15 +153,10 @@ class VulnerabilityResultSerializer(serializers.ModelSerializer):
 
 class SSLResultSerializer(serializers.ModelSerializer):
     """
-    SSL/TLS certificate + protocol-attack findings.
-
-    ``findings`` surfaces the SSL-related VulnerabilityResult rows produced by
-    the audit engine (named attacks like BEAST/POODLE/Lucky13/RC4/3DES, weak
-    ciphers, deprecated TLS, untrusted certs, Heartbleed) so the certificates
-    UI can render a dedicated attacks table/chart.
+    SSL/TLS certificate results. Protocol-attack findings (BEAST/POODLE/
+    Lucky13/RC4/3DES, weak ciphers, deprecated TLS, Heartbleed) are persisted
+    as VulnerabilityResult rows and surface in the main Vulnerabilities tab.
     """
-
-    findings = serializers.SerializerMethodField()
 
     class Meta:
         model = SSLResult
@@ -184,46 +179,6 @@ class SSLResultSerializer(serializers.ModelSerializer):
             "dns_count",
             "created_at",
             "updated_at",
-            "findings",
-        ]
-
-    def get_findings(self, obj):
-        sub = (obj.subdomain or "").strip()
-        dom = (obj.domain or "").strip()
-
-        # Prefer the prefetched per-scan SSL findings (added by
-        # SSLResultListView.get_queryset) to avoid N+1 queries.
-        prefetched = getattr(obj, "_prefetched_objects_cache", {}).get("vulnerabilities")
-        if prefetched is not None:
-            ssl_vulns = [v for v in prefetched if sub and v.subdomain == sub or (not sub and v.subdomain == dom)]
-        else:
-            qs = VulnerabilityResult.objects.filter(scan=obj.scan)
-            if sub:
-                # Exact subdomain match (the scanner stores SSL vulns under the
-                # scanned host, e.g. app.example.com).
-                qs = qs.filter(subdomain=sub)
-            else:
-                # No subdomain recorded on the SSL row (fallback-created rows
-                # have only `domain` set) -> match by domain so findings are not lost.
-                if dom:
-                    qs = qs.filter(subdomain=dom)
-            ssl_vulns = list(qs)
-
-        return [
-            {
-                "vulnerability_id": v.vulnerability_id,
-                "severity": v.severity,
-                "cve": v.cve or "",
-                "cwe": v.cwe or "",
-                "finding": v.finding or "",
-                "description": v.description or "",
-                "remediation": v.remediation or "",
-                "template_id": v.template_id or "",
-                "finding_status": v.finding_status or "",
-                "confidence": v.confidence,
-                "evidence": v.evidence or "",
-            }
-            for v in ssl_vulns
         ]
 
 
