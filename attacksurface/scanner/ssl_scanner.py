@@ -384,27 +384,49 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "remediation": "Disable TLS 1.1 and enforce TLS 1.2 or TLS 1.3."
         })
 
-    # ── POODLE (CVE-2014-3566) ────────────────────────────────────────────────
+    # ── 1. POODLE (CVE-2014-3566 & CVE-2014-8730) ─────────────────────────────────
     has_sslv3 = "SSLv3" in results["supported_protocols"] or "SSLv3.0" in results["supported_protocols"]
+    has_tls10 = any(p in results["supported_protocols"] for p in ["TLSv1.0", "TLSv1"])
+    has_tls11 = "TLSv1.1" in results["supported_protocols"]
+    has_cbc = any("CBC" in c.upper() for c in results["ciphers"])
+
     if has_sslv3:
         grade_penalty += 45
         results["vulnerabilities"].append({
-            "vulnerability_id": "SSL-POODLE-VULNERABILITY",
+            "vulnerability_id": "SSL-POODLE-SSLV3",
             "domain": host,
             "subdomain": host,
             "severity": "HIGH",
             "cve": "CVE-2014-3566",
             "cwe": "CWE-310",
-            "finding": f"POODLE SSLv3 Vulnerability (CVE-2014-3566) detected on {host}:{port}",
+            "finding": f"POODLE SSLv3 Padding Oracle Vulnerability (CVE-2014-3566) on {host}:{port}",
             "template_id": "ssl/poodle-sslv3",
-            "source_tool": "Nmap (ssl-enum-ciphers)",
-            "description": "The server supports SSLv3, making it vulnerable to the POODLE (Padding Oracle On Downgraded Legacy Encryption) attack, allowing Man-in-the-Middle attackers to decrypt secret session cookies and HTTPS data.",
-            "remediation": "Disable SSL 3.0 support on web servers, load balancers, and reverse proxies."
+            "source_tool": "SSL/TLS Cipher Audit",
+            "configuration_trigger": "SSL 3.0 protocol supported with CBC cipher suites",
+            "description": "The server supports SSL 3.0, enabling POODLE (Padding Oracle On Downgraded Legacy Encryption) attacks. Attackers can decrypt secret session cookies and HTTPS payload data.",
+            "remediation": "Disable SSL 3.0 support entirely on web servers, load balancers, and reverse proxies."
+        })
+    elif (has_tls10 or has_tls11) and has_cbc:
+        results["vulnerabilities"].append({
+            "vulnerability_id": "SSL-POODLE-TLS",
+            "domain": host,
+            "subdomain": host,
+            "severity": "MEDIUM",
+            "cve": "CVE-2014-8730",
+            "cwe": "CWE-310",
+            "finding": f"POODLE TLS CBC Variant Potential Vulnerability (CVE-2014-8730) on {host}:{port}",
+            "template_id": "ssl/poodle-tls",
+            "source_tool": "SSL/TLS Cipher Audit",
+            "configuration_trigger": f"Legacy TLS ({'TLS 1.0' if has_tls10 else 'TLS 1.1'}) enabled with CBC mode ciphers",
+            "description": "The server supports legacy TLS versions with CBC-mode cipher suites. Improper MAC padding check implementations can allow POODLE-style decryption attacks over TLS.",
+            "remediation": "Disable TLS 1.0/1.1 and enforce TLS 1.2 or TLS 1.3 with AEAD cipher suites (AES-GCM / CHACHA20)."
         })
 
-    # ── SWEET32 (CVE-2016-2183 / CVE-2016-6329) ────────────────────────────────
-    has_3des = any("3DES" in c.upper() or "DES-CBC3" in c.upper() for c in results["ciphers"])
-    if has_3des:
+    # ── 2. SWEET32 (CVE-2016-2183 / CVE-2016-6329) ────────────────────────────────
+    has_64bit_block_cipher = any(
+        kw in c.upper() for c in results["ciphers"] for kw in ["3DES", "DES-CBC3", "TRIPLEDES", "BLOWFISH", "CAST5", "IDEA"]
+    )
+    if has_64bit_block_cipher:
         grade_penalty += 20
         results["vulnerabilities"].append({
             "vulnerability_id": "SSL-SWEET32-3DES",
@@ -413,16 +435,15 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "severity": "MEDIUM",
             "cve": "CVE-2016-2183",
             "cwe": "CWE-326",
-            "finding": f"SWEET32 Birthday Attack 64-bit Block Cipher Enabled (CVE-2016-2183) on {host}:{port}",
+            "finding": f"SWEET32 Birthday Attack 64-bit Block Cipher (CVE-2016-2183) on {host}:{port}",
             "template_id": "ssl/sweet32-3des",
-            "source_tool": "Nmap (ssl-enum-ciphers)",
-            "description": "The server supports 64-bit block size ciphers (3DES / Triple-DES), vulnerable to collision attacks (SWEET32) when transmitting large volumes of HTTPS data over a single TLS connection.",
-            "remediation": "Disable 3DES and DES-CBC3 cipher suites in web server configuration and enforce AES or ChaCha20."
+            "source_tool": "SSL/TLS Cipher Audit",
+            "configuration_trigger": "64-bit block size cipher suite enabled (3DES / Triple-DES / DES-CBC3)",
+            "description": "The server supports 64-bit block size ciphers (such as 3DES), which are vulnerable to SWEET32 birthday collision attacks after processing large volumes of HTTPS requests on a single connection.",
+            "remediation": "Disable 3DES and DES-CBC3 cipher suites in web server configuration and enforce 128-bit or 256-bit AES / ChaCha20 ciphers."
         })
 
-    # ── BEAST (CVE-2011-3389) ──────────────────────────────────────────────────
-    has_tls10 = any(p in results["supported_protocols"] for p in ["TLSv1.0", "TLSv1"])
-    has_cbc = any("CBC" in c.upper() for c in results["ciphers"])
+    # ── 3. BEAST (CVE-2011-3389) ──────────────────────────────────────────────────
     if has_tls10 and has_cbc:
         grade_penalty += 25
         results["vulnerabilities"].append({
@@ -432,14 +453,15 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "severity": "MEDIUM",
             "cve": "CVE-2011-3389",
             "cwe": "CWE-326",
-            "finding": f"BEAST Attack Vulnerability (CVE-2011-3389) via TLS 1.0 CBC Ciphers on {host}:{port}",
+            "finding": f"BEAST Vulnerability (CVE-2011-3389) via TLS 1.0 CBC Ciphers on {host}:{port}",
             "template_id": "ssl/beast-attack",
-            "source_tool": "Nmap (ssl-enum-ciphers)",
-            "description": "TLS 1.0 combined with Cipher Block Chaining (CBC) mode ciphers allows Man-in-the-Middle attackers to decrypt encrypted HTTPS communication using the BEAST attack.",
+            "source_tool": "SSL/TLS Cipher Audit",
+            "configuration_trigger": "TLS 1.0 protocol enabled with CBC-mode cipher suites",
+            "description": "TLS 1.0 combined with Cipher Block Chaining (CBC) mode ciphers allows Man-in-the-Middle attackers to decrypt encrypted HTTPS communication via initialization vector prediction (BEAST attack).",
             "remediation": "Disable TLS 1.0 protocol support and enforce TLS 1.2 or TLS 1.3."
         })
 
-    # ── LUCKY13 (CVE-2013-0169) ────────────────────────────────────────────────
+    # ── 4. LUCKY13 (CVE-2013-0169) ────────────────────────────────────────────────
     has_legacy_tls = any(p in results["supported_protocols"] for p in ["TLSv1.0", "TLSv1", "TLSv1.1", "TLSv1.2"])
     if has_legacy_tls and has_cbc:
         results["vulnerabilities"].append({
@@ -451,8 +473,9 @@ def audit_ssl_cipher_suites(host, port=443, timeout=5):
             "cwe": "CWE-208",
             "finding": f"LUCKY13 TLS CBC Timing Side-Channel Vulnerability (CVE-2013-0169) on {host}:{port}",
             "template_id": "ssl/lucky13-timing",
-            "source_tool": "Nmap (ssl-enum-ciphers)",
-            "description": "The server supports CBC-mode cipher suites with standard MAC-then-Encrypt construction, vulnerable to timing side-channel attacks (LUCKY13) allowing plaintext recovery.",
+            "source_tool": "SSL/TLS Cipher Audit",
+            "configuration_trigger": "Legacy TLS (1.0/1.1/1.2) supported with MAC-then-Encrypt CBC cipher suites",
+            "description": "The server supports CBC-mode cipher suites with standard MAC-then-Encrypt construction, making it vulnerable to timing side-channel analysis (LUCKY13 attack) to recover plaintext bytes.",
             "remediation": "Prefer AEAD ciphers (e.g. AES-GCM, CHACHA20-POLY1305) and disable CBC mode cipher suites or enable Encrypt-then-MAC extension."
         })
 
