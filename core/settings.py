@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     'brand_monitoring',
     'mobile_vapt',
     'findings',
+    'owasp_scanner',
 ]
 
 MIDDLEWARE = [
@@ -143,6 +144,11 @@ SIMPLE_JWT = {
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 CORS_ALLOW_ALL_ORIGINS = True
+
+from corsheaders.defaults import default_headers
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'ngrok-skip-browser-warning',
+]
 
 # ─── Cache ────────────────────────────────────────────────────────────────────
 CACHES = {

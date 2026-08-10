@@ -4,13 +4,15 @@ from django.db import models
 class MobileScan(models.Model):
     app_name = models.CharField(max_length=255, blank=True, null=True)
     package_name = models.CharField(max_length=255, blank=True, null=True)
-    file_name = models.CharField(max_length=255)
+    file_name = models.CharField(max_length=255, blank=True, null=True)
     file_path = models.CharField(max_length=500, blank=True, null=True)
-    scan_hash = models.CharField(max_length=255, unique=True)
+    apk_file = models.FileField(upload_to='mobile_apps/', blank=True, null=True)
+    scan_hash = models.CharField(max_length=255, unique=True, blank=True, null=True)
     status = models.CharField(max_length=50, default='uploaded')
     version_name = models.CharField(max_length=255, blank=True, null=True)
     score = models.CharField(max_length=50, blank=True, null=True)
     source = models.CharField(max_length=50, blank=True, null=True)
+    vt_scan_id = models.CharField(max_length=255, blank=True, null=True)
     uploaded_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

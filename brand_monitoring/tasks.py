@@ -57,6 +57,9 @@ def _create_report(target, domain, org_id, stats=None, error_message=""):
                 "timeout": timeout,
             },
             "total_votes": stats.get("total_votes", {}) if stats else {},
+            "registrar": stats.get("registrar", ""),
+            "creation_date": stats.get("creation_date", ""),
+            "full_attributes": stats.get("full_attributes", {}) if stats else {},
         } if stats else {},
         error_message=error_message,
         org_id=org_id,
@@ -186,6 +189,9 @@ def check_domain_virustotal(self, target_id=None, domain=None, org_id=None):
             "categories": categories,
             "tags": tags,
             "total_votes": attributes.get("total_votes", {}),
+            "registrar": attributes.get("registrar", ""),
+            "creation_date": attributes.get("creation_date", ""),
+            "full_attributes": attributes,
         }
 
         if target:

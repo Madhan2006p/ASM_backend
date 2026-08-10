@@ -38,3 +38,4 @@ scan_outputs/
 *.log
 *.tmp
 tools/
+node_modules/

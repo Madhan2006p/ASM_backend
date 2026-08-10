@@ -234,3 +234,51 @@ class ImpersonatingAccountResult(models.Model):
 
     def __str__(self):
         return f"{self.platform_label}: {self.username}"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Anti Phishing Module
+# ──────────────────────────────────────────────────────────────────────────────
+
+class AntiPhishingScan(models.Model):
+    STATUS_CHOICES = (
+        ('pending', 'Pending'),
+        ('running', 'Running'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    )
+
+    url = models.URLField(max_length=500)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    
+    # AlienVault OTX
+    alienvault_pulse_count = models.IntegerField(default=0)
+    alienvault_reputation = models.JSONField(default=dict, blank=True)
+    
+    # MISP
+    misp_iocs_found = models.IntegerField(default=0)
+    misp_events = models.JSONField(default=list, blank=True)
+    
+    # Phishing Analysis
+    suspicious_keywords_found = models.JSONField(default=list, blank=True)
+    domain_similarity_score = models.FloatField(default=0.0)
+    domain_reputation = models.CharField(max_length=50, blank=True, default='')
+    
+    risk_score = models.IntegerField(default=0)  # Input score
+    classification = models.CharField(max_length=50, blank=True, default='')  # e.g., Safe, Suspicious, Malicious
+    
+    # New Ecosystem fields
+    ecosystem_score = models.IntegerField(default=0)
+    ecosystem_classification = models.CharField(max_length=50, blank=True, default='')
+    related_assets_found = models.IntegerField(default=0)
+    reasons = models.JSONField(default=list, blank=True)
+    org_id = models.CharField(max_length=50, default="1")
+    created_at = models.DateTimeField(default=timezone.now)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Anti Phishing Scan"
+        verbose_name_plural = "Anti Phishing Scans"
+
+    def __str__(self):
+        return f"AntiPhishingScan for {self.url} [{self.status}]"

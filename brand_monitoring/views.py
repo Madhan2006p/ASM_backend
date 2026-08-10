@@ -11,7 +11,7 @@ from authentication.permissions import (
     get_user_org_id,
 )
 
-from .models import BrandMonitorTarget, VirusTotalReport, SuspiciousDomainReport, PhishingDomainReport, ImpersonatingScan, ImpersonatingAccountResult
+from .models import BrandMonitorTarget, VirusTotalReport, SuspiciousDomainReport, PhishingDomainReport, ImpersonatingScan, ImpersonatingAccountResult, AntiPhishingScan
 from .serializers import (
     BrandMonitorTargetSerializer,
     VirusTotalReportSerializer,
@@ -20,6 +20,7 @@ from .serializers import (
     PhishingDomainReportSerializer,
     ImpersonatingScanSerializer,
     ImpersonatingAccountResultSerializer,
+    AntiPhishingScanSerializer,
 )
 from .tasks import check_domain_virustotal, analyze_suspicious_domain_task, analyze_phishing_domain_task
 from authentication.models import Organization
@@ -46,7 +47,7 @@ class BrandMonitorTargetViewSet(viewsets.ModelViewSet):
                 AttackSurfaceScan.objects.filter(org_id=org_id)
                 .values_list('target', flat=True)
             )
-            all_domains = monitored_domains | scanned_domains
+            all_domains = scanned_domains
             
             # Get existing BrandMonitorTarget domains
             existing_targets = BrandMonitorTarget.objects.filter(org_id=org_id)
@@ -55,13 +56,80 @@ class BrandMonitorTargetViewSet(viewsets.ModelViewSet):
             # Targets to create
             to_create = all_domains - existing_domains
             for domain in to_create:
-                BrandMonitorTarget.objects.create(
+                target = BrandMonitorTarget.objects.create(
                     domain=domain,
                     brand_name=domain.split('.')[0].capitalize(),
                     is_active=True,
                     status='active',
                     org_id=org_id
                 )
+                
+                # Auto-trigger Brand Monitoring Scans for newly synced domains
+                import threading
+                
+                try:
+                    check_domain_virustotal.delay(target_id=target.id)
+                except Exception as e:
+                    logger.error(f"Auto-VT scan failed for {domain}: {e}")
+                
+                try:
+                    s_report = SuspiciousDomainReport.objects.create(
+                        domain=domain,
+                        status='pending',
+                        org_id=org_id
+                    )
+                    analyze_suspicious_domain_task.delay(s_report.id)
+                except Exception as e:
+                    logger.error(f"Auto-Suspicious scan failed for {domain}: {e}")
+                    
+                try:
+                    def _run_phishing(t_id):
+                        try:
+                            analyze_phishing_domain_task.run(t_id)
+                        except Exception as err:
+                            import logging
+                            logging.getLogger(__name__).error(f"Background phishing scan failed for target {t_id}: {err}")
+                    threading.Thread(target=_run_phishing, args=(target.id,), daemon=True).start()
+                except Exception as e:
+                    logger.error(f"Auto-Phishing scan start failed for {domain}: {e}")
+
+                # 4. Trigger Impersonation Scan
+                try:
+                    org_name_val = domain.split('.')[0].capitalize()
+                    try:
+                        from authentication.models import Organization
+                        org = Organization.objects.filter(org_id=org_id).first()
+                        if org and org.name:
+                            org_name_val = org.name.strip()
+                    except Exception:
+                        pass
+                        
+                    username_val = "".join(e for e in org_name_val if e.isalnum()).lower()
+                    if not username_val:
+                        username_val = domain.split('.')[0].lower()
+
+                    i_scan = ImpersonatingScan.objects.create(
+                        username=username_val,
+                        brand_domain=domain,
+                        org_name=org_name_val,
+                        org_id=org_id,
+                        status="pending"
+                    )
+                    
+                    def _run_impersonation(s_id):
+                        try:
+                            from .impersonation_tasks import run_impersonation_scan
+                            run_impersonation_scan(s_id)
+                        except Exception as err:
+                            import logging
+                            logging.getLogger(__name__).error(f"Background impersonation scan failed for scan {s_id}: {err}")
+                            try:
+                                ImpersonatingScan.objects.filter(id=s_id).update(status="failed")
+                            except Exception:
+                                pass
+                    threading.Thread(target=_run_impersonation, args=(i_scan.id,), daemon=True).start()
+                except Exception as e:
+                    logger.error(f"Auto-Impersonation scan start failed for {domain}: {e}")
                 
             # Targets to delete (no longer monitored or scanned)
             to_delete = existing_domains - all_domains
@@ -164,18 +232,28 @@ class BrandMonitorTargetViewSet(viewsets.ModelViewSet):
         latest_reports = VirusTotalReport.objects.filter(id__in=latest_ids) \
             .select_related('target').order_by('-checked_at')[:10]
 
-        serializer = BrandMonitorDashboardSerializer(data={
+        # Calculate additional metrics for frontend
+        total_suspicious_domains = SuspiciousDomainReport.objects.filter(org_id=org_id).count()
+        total_phishing_domains = PhishingDomainReport.objects.filter(org_id=org_id).count()
+        total_impersonations = ImpersonatingAccountResult.objects.filter(org_id=org_id).count()
+        
+        # Define what constitutes an active alert (could be expanded later)
+        active_alerts = (total_malicious or 0) + (total_suspicious or 0)
+
+        serializer = BrandMonitorDashboardSerializer(instance={
             'total_targets': targets.count(),
             'total_reports': reports.count(),
             'active_targets': targets.filter(is_active=True).count(),
             'total_malicious': total_malicious,
             'total_suspicious': total_suspicious,
+            'total_suspicious_domains': total_suspicious_domains,
+            'total_phishing_domains': total_phishing_domains,
+            'total_impersonations': total_impersonations,
+            'active_alerts': active_alerts,
             'org_name': org_name,
-            'latest_reports': VirusTotalReportSerializer(latest_reports, many=True).data,
+            'latest_reports': latest_reports,
             'targets_by_status': status_counts,
         })
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         return Response(serializer.data)
 
 
@@ -445,3 +523,50 @@ class ImpersonatingAccountResultViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+
+class AntiPhishingScanViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for Anti Phishing scans.
+    """
+    serializer_class = AntiPhishingScanSerializer
+    permission_classes = [permissions.IsAuthenticated, IsAuthenticatedAndOrgMember]
+    required_module = "brand_monitoring"
+
+    def get_queryset(self):
+        org_id = get_user_org_id(self.request)
+        return AntiPhishingScan.objects.filter(org_id=org_id)
+
+    def create(self, request, *args, **kwargs):
+        import threading
+        import logging as _logging
+        from .anti_phishing_tasks import run_anti_phishing_scan
+
+        org_id = get_user_org_id(request)
+        url = request.data.get("url", "").strip()
+
+        if not url:
+            return Response({"detail": "url is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        scan = AntiPhishingScan.objects.create(
+            url=url,
+            org_id=org_id,
+            status="pending",
+        )
+
+        def _bg(scan_id):
+            try:
+                run_anti_phishing_scan(scan_id)
+            except Exception as e:
+                _logging.getLogger(__name__).error(f"Anti Phishing scan {scan_id} failed: {e}")
+                try:
+                    AntiPhishingScan.objects.filter(id=scan_id).update(status="failed")
+                except Exception:
+                    pass
+
+        threading.Thread(target=_bg, args=(scan.id,), daemon=True).start()
+
+        return Response({
+            "status": "queued",
+            "scan_id": scan.id,
+            "url": scan.url,
+        }, status=status.HTTP_201_CREATED)

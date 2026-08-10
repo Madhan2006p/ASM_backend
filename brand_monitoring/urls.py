@@ -8,6 +8,7 @@ from .views import (
     PhishingDomainReportViewSet,
     ImpersonatingScanViewSet,
     ImpersonatingAccountResultViewSet,
+    AntiPhishingScanViewSet,
 )
 
 router = DefaultRouter()
@@ -17,6 +18,7 @@ router.register(r'suspicious-domains', SuspiciousDomainReportViewSet, basename='
 router.register(r'phishing-domains', PhishingDomainReportViewSet, basename='phishing-domain')
 router.register(r'impersonation-scans', ImpersonatingScanViewSet, basename='impersonation-scan')
 router.register(r'impersonation-results', ImpersonatingAccountResultViewSet, basename='impersonation-result')
+router.register(r'anti-phishing', AntiPhishingScanViewSet, basename='anti-phishing')
 
 urlpatterns = [
     path('', include(router.urls)),

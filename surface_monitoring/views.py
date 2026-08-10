@@ -1,390 +1,379 @@
 import os
-import re
-import requests
-from datetime import timedelta
-
+import shutil
+import sqlite3
+import threading
+import subprocess
+import tempfile
+import time
+import json
+from pathlib import Path
 from django.utils import timezone
-
-from rest_framework import permissions, status, viewsets
-from rest_framework.decorators import action
+from rest_framework import viewsets, permissions, status
 from rest_framework.response import Response
+from rest_framework.decorators import action
+from rest_framework.views import APIView
 
-from authentication.permissions import (
-    IsAuthenticatedAndOrgMember,
-    IsOrgAdmin,
-    get_user_org_id,
+from authentication.permissions import IsAuthenticatedAndOrgMember, get_user_org_id
+from .models import SpiderfootScan, SpiderfootResult
+from .serializers import SpiderfootScanSerializer, SpiderfootResultSerializer
+
+# Spiderfoot's internal scan database. Results are streamed from here while the
+# scan is still running so the module shows live findings instead of waiting
+# for the final JSON dump.
+SPIDERFOOT_DB_PATH = os.getenv(
+    'SPIDERFOOT_DB_PATH',
+    str(Path.home() / '.spiderfoot' / 'spiderfoot.db'),
 )
-
-from .models import GitHubRepository, RepoEvent, RepoScan, SurfaceMonitorConfig
-from .serializers import (
-    GitHubRepositorySerializer,
-    RepoEventSerializer,
-    RepoScanSerializer,
-    SurfaceMonitorConfigSerializer,
-    SurfaceMonitorDashboardSerializer,
-)
-from .tasks import discover_github_repos, discover_org_repos, poll_repo_events, scan_repo_with_gitleaks
-
-GITHUB_API_BASE = "https://api.github.com"
-GITHUB_HEADERS = {
-    "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "ASMM-SurfaceMonitor/1.0",
-}
-_GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-if _GITHUB_TOKEN:
-    GITHUB_HEADERS["Authorization"] = f"token {_GITHUB_TOKEN}"
+RESULT_POLL_SECONDS = float(os.getenv('SPIDERFOOT_RESULT_POLL', '10'))
+SCAN_TIMEOUT_SECONDS = float(os.getenv('SPIDERFOOT_SCAN_TIMEOUT', '3600'))
 
 
-class SurfaceMonitorConfigViewSet(viewsets.ModelViewSet):
+def _resolve_spiderfoot():
     """
-    CRUD for surface monitor configurations (keywords to watch).
+    Resolve the Spiderfoot CLI to execute.
+
+    Returns a (python_bin, sf_path) tuple, or (None, None) when Spiderfoot
+    cannot be located. Resolution order:
+      1. SPIDERFOOT_PYTHON / SPIDERFOOT_SF_PATH environment variables
+      2. ~/spiderfoot/ (venv + sf.py)  — typical local install
+      3. Legacy path used by the original developer machine
+      4. A `spiderfoot` executable on PATH
     """
-    serializer_class = SurfaceMonitorConfigSerializer
+    python_bin = os.getenv('SPIDERFOOT_PYTHON')
+    sf_path = os.getenv('SPIDERFOOT_SF_PATH')
+
+    candidates = [
+        (python_bin, sf_path),
+        (str(Path.home() / 'spiderfoot' / 'venv' / 'bin' / 'python'),
+         str(Path.home() / 'spiderfoot' / 'sf.py')),
+        ('/home/madhan/Desktop/spiderfoot/venv/bin/python',
+         '/home/madhan/Desktop/spiderfoot/sf.py'),
+    ]
+    for py, sf in candidates:
+        if py and sf and os.path.isfile(py) and os.path.isfile(sf):
+            return py, sf
+
+    which = shutil.which('spiderfoot')
+    if which:
+        return which, None
+    return None, None
+
+
+def _find_scan_instance_id(scan, db_path):
+    """
+    Find Spiderfoot's internal scan instance id for a Django scan.
+
+    The instance is created inside Spiderfoot's own database when the scan
+    starts, so it may not exist yet on the first call — callers should retry.
+    """
+    if not db_path or not os.path.isfile(db_path):
+        return None
+    start_ms = int(scan.created_at.timestamp() * 1000)
+    try:
+        con = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=15)
+        try:
+            cur = con.cursor()
+            # First instance started after this scan was created. ASC (rather
+            # than DESC) keeps correlation correct even when two scans of the
+            # same target overlap.
+            cur.execute(
+                "SELECT guid FROM tbl_scan_instance "
+                "WHERE seed_target = ? AND started >= ? "
+                "ORDER BY started ASC LIMIT 1",
+                (scan.target, start_ms),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+        finally:
+            con.close()
+    except Exception as exc:
+        print("Spiderfoot scan instance lookup failed:", exc)
+        return None
+
+
+def _import_incremental_results(scan, instance_guid, seen_hashes, db_path):
+    """
+    Import Spiderfoot results accumulated so far for this scan instance.
+
+    Rows already imported for this scan (tracked by their spiderfoot hash) are
+    skipped, so repeated polls are idempotent. Returns the number of new rows.
+    """
+    if not instance_guid or not db_path or not os.path.isfile(db_path):
+        return 0
+    try:
+        con = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=15)
+        try:
+            cur = con.cursor()
+            cur.execute(
+                "SELECT hash, type, module, data FROM tbl_scan_results "
+                "WHERE scan_instance_id = ?",
+                (instance_guid,),
+            )
+            new_rows = []
+            for h, data_type, module, data in cur.fetchall():
+                if h in seen_hashes:
+                    continue
+                seen_hashes.add(h)
+                new_rows.append(SpiderfootResult(
+                    scan=scan,
+                    data_type=str(data_type or 'Unknown')[:255],
+                    data_value=str(data or ''),
+                    module=str(module or 'Spiderfoot')[:255],
+                    source=str(instance_guid)[:255],
+                ))
+            if new_rows:
+                SpiderfootResult.objects.bulk_create(new_rows)
+            return len(new_rows)
+        finally:
+            con.close()
+    except Exception as exc:
+        print("Spiderfoot DB result import failed:", exc)
+        return 0
+
+
+def _import_json_results(scan, json_text):
+    """Fallback importer used when Spiderfoot's internal DB is unavailable."""
+    start_idx = json_text.find('[')
+    end_idx = json_text.rfind(']')
+    if start_idx == -1 or end_idx == -1:
+        return 0
+    try:
+        items = json.loads(json_text[start_idx:end_idx + 1])
+    except (ValueError, TypeError):
+        return 0
+    results_to_create = []
+    for item in items:
+        results_to_create.append(SpiderfootResult(
+            scan=scan,
+            data_type=str(item.get('type', 'Unknown'))[:255],
+            data_value=item.get('data', ''),
+            module=str(item.get('module', 'Spiderfoot'))[:255],
+            source=str(item.get('source', ''))[:255],
+        ))
+    if results_to_create:
+        SpiderfootResult.objects.bulk_create(results_to_create)
+    return len(results_to_create)
+
+
+def run_spiderfoot_scan_thread(scan_id):
+    try:
+        scan = SpiderfootScan.objects.get(id=scan_id)
+    except SpiderfootScan.DoesNotExist:
+        return
+
+    scan.status = 'running'
+    scan.save()
+
+    python_bin, sf_path = _resolve_spiderfoot()
+    if not python_bin:
+        scan.status = 'failed'
+        scan.completed_at = timezone.now()
+        scan.save()
+        print(
+            "Spiderfoot scan failed: spiderfoot installation not found. "
+            "Set SPIDERFOOT_PYTHON and SPIDERFOOT_SF_PATH env vars, or "
+            "install Spiderfoot at ~/spiderfoot/."
+        )
+        return
+
+    # `sf_path` is None when a single `spiderfoot` executable on PATH is used.
+    cmd = [python_bin]
+    if sf_path:
+        cmd.append(sf_path)
+    cmd += ["-s", scan.target, "-u", "all", "-q", "-o", "json"]
+
+    db_path = SPIDERFOOT_DB_PATH
+    seen_hashes = set()
+    instance_guid = None
+    total_imported = 0
+
+    # Capture stdout/stderr to temp files instead of pipes so the child can
+    # never block on a full pipe buffer; the stdout file also serves as a JSON
+    # fallback source and stderr keeps failure diagnostics available.
+    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+    tmp_err = tempfile.NamedTemporaryFile(delete=False, suffix='.err')
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=tmp_out, stderr=tmp_err,
+        )
+    except Exception as e:
+        tmp_out.close()
+        tmp_err.close()
+        for p in (tmp_out.name, tmp_err.name):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        import traceback
+        traceback.print_exc()
+        print("Spiderfoot scan thread exception:", e)
+        scan.status = 'failed'
+        scan.completed_at = timezone.now()
+        scan.save()
+        return
+
+    try:
+        # Stream results from Spiderfoot's internal DB while the scan runs,
+        # so findings appear live instead of only after completion.
+        deadline = time.monotonic() + SCAN_TIMEOUT_SECONDS
+        timed_out = False
+        while proc.poll() is None:
+            if time.monotonic() >= deadline:
+                timed_out = True
+                print(
+                    f"Spiderfoot scan {scan.id} timed out after "
+                    f"{int(SCAN_TIMEOUT_SECONDS)}s; terminating process."
+                )
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
+                break
+            if not instance_guid:
+                instance_guid = _find_scan_instance_id(scan, db_path)
+            if instance_guid:
+                imported = _import_incremental_results(
+                    scan, instance_guid, seen_hashes, db_path
+                )
+                if imported:
+                    total_imported += imported
+                    print(
+                        f"Spiderfoot scan {scan.id}: "
+                        f"imported {imported} new results (total {total_imported})"
+                    )
+            time.sleep(RESULT_POLL_SECONDS)
+
+        # Final sweep after the process exits.
+        if not instance_guid:
+            instance_guid = _find_scan_instance_id(scan, db_path)
+        total_imported += _import_incremental_results(
+            scan, instance_guid, seen_hashes, db_path
+        )
+
+        if timed_out:
+            scan.status = 'failed'
+        elif proc.returncode == 0:
+            # Fallback: if the DB import found nothing (e.g. non-standard DB
+            # location), parse the JSON dump written to the temp file.
+            if total_imported == 0:
+                tmp_out.flush()
+                try:
+                    with open(tmp_out.name, 'r', errors='replace') as f:
+                        json_text = f.read()
+                    total_imported += _import_json_results(scan, json_text)
+                except OSError as exc:
+                    print("Spiderfoot JSON fallback read failed:", exc)
+            scan.status = 'completed'
+        else:
+            print("Spiderfoot scan process failed with code:", proc.returncode)
+            try:
+                with open(tmp_err.name, 'r', errors='replace') as f:
+                    stderr_tail = '\n'.join(f.readlines()[-20:])
+                if stderr_tail.strip():
+                    print("Spiderfoot stderr tail:", stderr_tail)
+            except OSError:
+                pass
+            scan.status = 'failed'
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print("Spiderfoot scan thread exception:", e)
+        scan.status = 'failed'
+        print(f"Spiderfoot scan failed for {scan.target}: {e}")
+    finally:
+        tmp_out.close()
+        tmp_err.close()
+        for p in (tmp_out.name, tmp_err.name):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        scan.completed_at = timezone.now()
+        scan.save()
+
+
+class SpiderfootScanViewSet(viewsets.ModelViewSet):
+    serializer_class = SpiderfootScanSerializer
     permission_classes = [permissions.IsAuthenticated, IsAuthenticatedAndOrgMember]
 
     def get_queryset(self):
         org_id = get_user_org_id(self.request)
-        return SurfaceMonitorConfig.objects.filter(org_id=org_id)
+        return SpiderfootScan.objects.filter(org_id=org_id)
 
     def perform_create(self, serializer):
         org_id = get_user_org_id(self.request)
-        serializer.save(org_id=org_id)
+        scan = serializer.save(org_id=org_id, status='pending')
+        # Any scan still marked 'running' for the same target is stale (e.g.
+        # its process was orphaned by a backend restart). Mark it failed so
+        # duplicate live scans for one target can never pile up.
+        SpiderfootScan.objects.filter(
+            target=scan.target, status='running',
+        ).exclude(id=scan.id).update(
+            status='failed', completed_at=timezone.now(),
+        )
+        # Start scanning thread
+        thread = threading.Thread(target=run_spiderfoot_scan_thread, args=(scan.id,), daemon=True)
+        thread.start()
 
-    @action(detail=True, methods=['post'])
-    def discover(self, request, pk=None):
-        """
-        Trigger GitHub repo discovery for this config keyword.
-        """
-        config = self.get_object()
-        task = discover_github_repos.delay(config_id=config.id)
-        return Response({
-            'task_id': task.id,
-            'status': 'discovery_started',
-            'keyword': config.keyword,
-        }, status=status.HTTP_202_ACCEPTED)
+    @action(detail=True, methods=['get'])
+    def results(self, request, pk=None):
+        scan = self.get_object()
+        results = scan.results.all()
 
-    @action(detail=True, methods=['post'])
-    def discover_and_scan(self, request, pk=None):
-        """
-        Trigger discovery, then scan all repos for this config.
-        """
-        config = self.get_object()
-        task = discover_github_repos.delay(config_id=config.id)
-        return Response({
-            'task_id': task.id,
-            'status': 'discovery_started',
-            'keyword': config.keyword,
-            'note': 'Repos will be discovered. Use repo-level scan endpoints to trigger secret scanning.',
-        }, status=status.HTTP_202_ACCEPTED)
+        # Filter by data_type if provided
+        data_type = request.query_params.get('type')
+        if data_type:
+            results = results.filter(data_type=data_type)
 
-
-class GitHubRepositoryViewSet(viewsets.ModelViewSet):
-    """
-    CRUD for discovered GitHub repositories.
-    """
-    serializer_class = GitHubRepositorySerializer
-    permission_classes = [permissions.IsAuthenticated, IsAuthenticatedAndOrgMember]
-
-    def get_queryset(self):
-        org_id = get_user_org_id(self.request)
-        qs = GitHubRepository.objects.filter(org_id=org_id)
-
-        # Filter by config if provided
-        config_id = self.request.query_params.get('config')
-        if config_id:
-            qs = qs.filter(config_id=config_id)
-        return qs
-
-    def perform_create(self, serializer):
-        org_id = get_user_org_id(self.request)
-        serializer.save(org_id=org_id)
-
-    @action(detail=True, methods=['post'])
-    def scan(self, request, pk=None):
-        """
-        Trigger a Gitleaks scan on this repository.
-        """
-        repo = self.get_object()
-        task = scan_repo_with_gitleaks.delay(repo_id=repo.id)
-        return Response({
-            'task_id': task.id,
-            'repo': repo.full_name,
-            'status': 'scan_queued',
-        }, status=status.HTTP_202_ACCEPTED)
-
-    @action(detail=False, methods=['post'])
-    def scan_all(self, request):
-        """
-        Trigger Gitleaks scan on all discovered repos.
-        """
-        org_id = get_user_org_id(self.request)
-        repos = GitHubRepository.objects.filter(org_id=org_id)
-        task_ids = []
-        for repo in repos:
-            task = scan_repo_with_gitleaks.delay(repo_id=repo.id)
-            task_ids.append({'repo': repo.full_name, 'task_id': task.id})
-        return Response({
-            'tasks': task_ids,
-            'count': len(task_ids),
-            'status': 'batch_scan_queued',
-        }, status=status.HTTP_202_ACCEPTED)
-
-    @staticmethod
-    def _normalize_repo_full_name(raw):
-        """
-        Accept various GitHub repo formats and return 'owner/repo'.
-        Supports:
-          - 'octocat/Hello-World'
-          - 'https://github.com/octocat/Hello-World'
-          - 'https://github.com/octocat/Hello-World.git'
-          - 'git@github.com:octocat/Hello-World.git'
-        """
-        raw = raw.strip()
-        # Already owner/repo format
-        if '/' in raw and 'github.com' not in raw and 'github.com:' not in raw:
-            # Strip trailing slash and .git extension
-            result = raw.rstrip('/')
-            if result.endswith('.git'):
-                result = result[:-4]
-            return result
-        # Full HTTPS URL: https://github.com/owner/repo[.git]
-        m = re.search(r'github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$', raw)
-        if m:
-            return m.group(1)
-        # SSH URL: git@github.com:owner/repo.git
-        m = re.search(r'git@github\.com:([^/]+/[^/]+?)(?:\.git)?/?$', raw)
-        if m:
-            return m.group(1)
-        return raw
-
-    @action(detail=False, methods=['post'])
-    def add_repo(self, request):
-        """
-        Manually add a GitHub repository by full_name (e.g. 'octocat/Hello-World').
-        Also accepts full URLs like 'https://github.com/octocat/Hello-World'.
-        Fetches repository metadata from the GitHub API.
-        """
-        raw = request.data.get('full_name', '').strip()
-        if not raw:
-            return Response(
-                {'error': 'full_name is required (e.g. "octocat/Hello-World")'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        full_name = self._normalize_repo_full_name(raw)
-
-        org_id = get_user_org_id(self.request)
-
-        # Check if already exists
-        existing = GitHubRepository.objects.filter(full_name=full_name, org_id=org_id).first()
-        if existing:
-            serializer = self.get_serializer(existing)
-            return Response({
-                'message': 'Repository already exists',
-                'repo': serializer.data,
-            })
-
-        # Fetch from GitHub API
-        try:
-            resp = requests.get(
-                f"{GITHUB_API_BASE}/repos/{full_name}",
-                headers=GITHUB_HEADERS,
-                timeout=15,
-            )
-            if resp.status_code == 403:
-                return Response(
-                    {'error': 'GitHub API rate limit hit. Set GITHUB_TOKEN env var for higher limits.'},
-                    status=status.HTTP_429_TOO_MANY_REQUESTS,
-                )
-            if resp.status_code == 404:
-                return Response(
-                    {'error': f'Repository "{full_name}" not found on GitHub.'},
-                    status=status.HTTP_404_NOT_FOUND,
-                )
-            if resp.status_code != 200:
-                return Response(
-                    {'error': f'GitHub API error: {resp.status_code}'},
-                    status=status.HTTP_502_BAD_GATEWAY,
-                )
-
-            repo_data = resp.json()
-            owner_data = repo_data.get('owner', {})
-            visibility = repo_data.get('visibility', 'public')
-
-            repo = GitHubRepository.objects.create(
-                name=repo_data.get('name', ''),
-                full_name=repo_data.get('full_name', ''),
-                repo_url=repo_data.get('html_url', ''),
-                owner=owner_data.get('login', ''),
-                owner_url=owner_data.get('html_url', ''),
-                description=repo_data.get('description') or '',
-                visibility=visibility,
-                language=repo_data.get('language') or '',
-                default_branch=repo_data.get('default_branch', 'main'),
-                stars=repo_data.get('stargazers_count', 0),
-                watching_count=repo_data.get('watchers_count', 0),
-                forks=repo_data.get('forks_count', 0),
-                open_issues=repo_data.get('open_issues_count', 0),
-                clone_url=repo_data.get('clone_url', ''),
-                last_github_updated=repo_data.get('updated_at'),
-                status='discovered',
-                org_id=org_id,
-            )
-
-            serializer = self.get_serializer(repo)
-            return Response({
-                'message': f'Repository "{full_name}" added successfully',
-                'repo': serializer.data,
-            }, status=status.HTTP_201_CREATED)
-
-        except requests.RequestException as e:
-            return Response(
-                {'error': f'Failed to fetch repository: {str(e)}'},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-
-    @action(detail=True, methods=['post'])
-    def poll_events(self, request, pk=None):
-        """
-        Trigger event polling for a single repository.
-        """
-        repo = self.get_object()
-        task = poll_repo_events.delay(repo_id=repo.id)
-        return Response({
-            'task_id': task.id,
-            'repo': repo.full_name,
-            'status': 'polling_started',
-        }, status=status.HTTP_202_ACCEPTED)
-
-    @action(detail=False, methods=['post'])
-    def discover_by_org(self, request):
-        """
-        Discover GitHub repositories belonging to the current organization.
-        Searches GitHub using the `org:` qualifier and saves any found repos.
-        Uses update_or_create so existing repos are updated, never duplicated.
-        No data is ever deleted — this is purely additive.
-        """
-        org_id = get_user_org_id(request)
-        from authentication.models import Organization
-        org = Organization.objects.filter(org_id=org_id).first()
-        org_name = org.name if org else "Unknown"
-
-        try:
-            result = discover_org_repos(org_id=org_id)
-            return Response({
-                'org_name': org_name,
-                'status': 'org_discovery_completed',
-                'repos_cleared': 0,
-                'result': result,
-            }, status=status.HTTP_200_OK)
-        except Exception as e:
-            return Response({
-                'org_name': org_name,
-                'status': 'org_discovery_failed',
-                'error': str(e),
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=False, methods=['get'])
-    def stats(self, request):
-        """
-        Return aggregate dashboard stats for surface monitoring.
-        """
-        org_id = get_user_org_id(self.request)
-        repos = GitHubRepository.objects.filter(org_id=org_id)
-        scans = RepoScan.objects.filter(org_id=org_id)
-        configs = SurfaceMonitorConfig.objects.filter(org_id=org_id)
-        events = RepoEvent.objects.filter(org_id=org_id)
-
-        total_secrets = sum(r.hardcoded_credentials_count for r in repos)
-
-        # Count by visibility
-        visibility_counts = {}
-        for r in repos:
-            v = r.visibility or 'unknown'
-            visibility_counts[v] = visibility_counts.get(v, 0) + 1
-
-        # Count by language
-        language_counts = {}
-        for r in repos:
-            lang = r.language or 'Unknown'
-            language_counts[lang] = language_counts.get(lang, 0) + 1
-
-        # Event breakdown (last 7 days)
-        recent = events.filter(event_occurred_at__gte=timezone.now() - timedelta(days=7))
-
-        # Get org name
-        org_name = "Unknown"
-        try:
-            from authentication.models import Organization
-            org = Organization.objects.filter(org_id=org_id).first()
-            if org:
-                org_name = org.name
-        except Exception:
-            pass
-
-        total_watching = sum(r.watching_count for r in repos if r.watching_count)
-
-        serializer = SurfaceMonitorDashboardSerializer(data={
-            'total_repos': repos.count(),
-            'total_scans': scans.count(),
-            'total_secrets_found': total_secrets,
-            'active_keywords': configs.filter(is_active=True).count(),
-            'org_name': org_name,
-            'total_watching': total_watching,
-            'recent_events': recent.count(),
-            'recent_pushes': recent.filter(event_type='push').count(),
-            'recent_creates': recent.filter(event_type='create').count(),
-            'recent_updates': recent.filter(event_type='repo_updated').count(),
-            'recent_action_success': recent.filter(event_type='action_completed').count(),
-            'recent_action_failed': recent.filter(event_type='action_failed').count(),
-            'latest_events': RepoEventSerializer(
-                recent.order_by('-event_occurred_at')[:5],
-                many=True
-            ).data,
-            'repos_by_visibility': visibility_counts,
-            'repos_by_language': language_counts,
-        })
-        serializer.is_valid(raise_exception=True)
+        serializer = SpiderfootResultSerializer(results, many=True)
         return Response(serializer.data)
 
 
-class RepoEventViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    Read-only view of GitHub repo events (pushes, creates, actions).
-    """
-    serializer_class = RepoEventSerializer
+class SpiderfootResultViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = SpiderfootResultSerializer
     permission_classes = [permissions.IsAuthenticated, IsAuthenticatedAndOrgMember]
 
     def get_queryset(self):
         org_id = get_user_org_id(self.request)
-        qs = RepoEvent.objects.filter(org_id=org_id).select_related('repository')
-
-        # Filter by repo
-        repo_id = self.request.query_params.get('repo')
-        if repo_id:
-            qs = qs.filter(repository_id=repo_id)
-
-        # Filter by event type
-        ev_type = self.request.query_params.get('type')
-        if ev_type:
-            qs = qs.filter(event_type=ev_type)
-
-        return qs
+        return SpiderfootResult.objects.filter(scan__org_id=org_id)
 
 
-class RepoScanViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    Read-only view of repo scan results.
-    """
-    serializer_class = RepoScanSerializer
+class SpiderfootStatsView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsAuthenticatedAndOrgMember]
 
-    def get_queryset(self):
-        org_id = get_user_org_id(self.request)
-        qs = RepoScan.objects.filter(org_id=org_id).select_related('repository')
+    def get(self, request):
+        org_id = get_user_org_id(request)
+        scans = SpiderfootScan.objects.filter(org_id=org_id)
+        results = SpiderfootResult.objects.filter(scan__org_id=org_id)
 
-        # Filter by repo if provided
-        repo_id = self.request.query_params.get('repo')
-        if repo_id:
-            qs = qs.filter(repository_id=repo_id)
-        return qs
+        # Count data types
+        from django.db.models import Count
+        type_counts = results.values('data_type').annotate(count=Count('id')).order_by('-count')
+        type_counts_dict = {item['data_type']: item['count'] for item in type_counts}
+
+        # Count modules
+        module_counts = results.values('module').annotate(count=Count('id')).order_by('-count')
+        module_counts_dict = {item['module']: item['count'] for item in module_counts}
+
+        latest_findings = []
+        for r in results.order_by('-created_at')[:15]:
+            latest_findings.append({
+                'id': r.id,
+                'target': r.scan.target,
+                'data_type': r.data_type,
+                'data_value': r.data_value,
+                'module': r.module,
+                'created_at': r.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            })
+
+        return Response({
+            'total_scans': scans.count(),
+            'completed_scans': scans.filter(status='completed').count(),
+            'running_scans': scans.filter(status='running').count(),
+            'total_results': results.count(),
+            'type_counts': type_counts_dict,
+            'module_counts': module_counts_dict,
+            'latest_findings': latest_findings
+        })

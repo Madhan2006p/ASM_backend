@@ -90,7 +90,7 @@ class OrganizationSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Organization
-        fields = ("id", "name", "org_id", "created_at", "member_count", "role")
+        fields = ("id", "name", "org_id", "created_at", "member_count", "role", "logo")
 
     def get_member_count(self, obj):
         return obj.memberships.count()

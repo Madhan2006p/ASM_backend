@@ -184,9 +184,8 @@ def _import_nuclei_result_to_faraday(output_file):
 @shared_task(bind=True)
 def run_nuclei_vuln_scan(self, scan_id):
     """
-    Executes Nuclei scanner with parallel tag-group execution for speed.
-    Each tag group (CVE, misconfig, exposure) runs as a separate subprocess
-    concurrently, then results are merged and deduplicated.
+    Executes Python vulnerability scanner on the scan target.
+    Persists discovered vulnerabilities to DB and exports report to Faraday if configured.
     """
     scan = Scan.objects.get(id=scan_id)
     scan.status = 'RUNNING'
@@ -196,103 +195,30 @@ def run_nuclei_vuln_scan(self, scan_id):
     target_domain = scan.target.domain
     target_url = f'https://{target_domain}'
 
-    # Collect already-known CVEs to skip redundant scanning
-    known_cves = set()
     try:
-        existing = Vulnerability.objects.filter(
-            target=scan.target, cve_id__isnull=False
-        ).values_list('cve_id', flat=True)
-        known_cves = {c for c in existing if c}
-    except Exception:
-        pass
+        from attacksurface.scanner.vulnerability_scanner import run_python_vuln_scanner
+        httpx_items = [{"url": target_url, "headers": {}, "status_code": 0}]
+        findings = run_python_vuln_scanner(target_domain, httpx_items)
 
-    try:
-        # Run tag groups in parallel for speed
-        group_outputs = {}
-        with ThreadPoolExecutor(max_workers=min(len(NUCLEI_TAG_GROUPS), 4)) as pool:
-            futures = {}
-            for i, group in enumerate(NUCLEI_TAG_GROUPS):
-                out = settings.SCAN_OUTPUT_DIR / f'nuclei_{scan_id}_group{i}.json'
-                future = pool.submit(_run_nuclei_tag_group, target_url, group, out)
-                futures[future] = (group, out)
-
-            for future in as_completed(futures):
-                group, out = futures[future]
-                try:
-                    future.result()
-                    if out.exists():
-                        group_outputs[group[0]] = out
-                except Exception as exc:
-                    logger.warning("Nuclei group %s failed: %s", group, exc)
-
-        # Parse and merge results from all groups
-        all_findings = []
-        for group_name, out_path in group_outputs.items():
-            with open(out_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    try:
-                        vuln_data = json.loads(line.strip())
-                        all_findings.append(vuln_data)
-                    except json.JSONDecodeError:
-                        continue
-
-            # Cleanup sub-group file
-            try:
-                out_path.unlink()
-            except OSError:
-                pass
-
-        # Merge into main output file
         output_file = settings.SCAN_OUTPUT_DIR / f'nuclei_{scan_id}.json'
         with open(output_file, 'w', encoding='utf-8') as f:
-            for item in all_findings:
-                f.write(json.dumps(item) + '\n')
+            f.write(json.dumps(findings, indent=2))
 
-        # Deduplicate by template_id to avoid double-counting
-        seen_templates = set()
-        for vuln_data in all_findings:
-            template_id = vuln_data.get('template-id', '')
-            if template_id in seen_templates:
-                continue
-            seen_templates.add(template_id)
-
-            title = vuln_data.get('info', {}).get('name', 'Unknown Vulnerability')
-            severity = vuln_data.get('info', {}).get('severity', 'info').upper()
-            description = vuln_data.get('info', {}).get('description', '')
-            remediation = vuln_data.get('info', {}).get('remediation', '')
-            cve_id = vuln_data.get('info', {}).get('classification', {}).get('cve-id', None)
-            cwe_id = vuln_data.get('info', {}).get('classification', {}).get('cwe-id', None)
-            references = ", ".join(vuln_data.get('info', {}).get('reference', []))
-
-            # Skip CVEs we already know about
-            if cve_id and cve_id in known_cves:
-                continue
-
-            severity_mapping = {
-                'INFO': 'INFO', 'LOW': 'LOW', 'MEDIUM': 'MEDIUM',
-                'HIGH': 'HIGH', 'CRITICAL': 'CRITICAL'
-            }
-            mapped_severity = severity_mapping.get(severity, 'MEDIUM')
-
-            # Enrich CVSS from NVD API if CVE is found
-            cvss_score = None
-            if cve_id:
-                cvss_score = fetch_nvd_cvss_score(cve_id)
+        for item in findings:
+            title = item.get('finding') or item.get('vulnerability_id') or 'Vulnerability Discovered'
+            severity = str(item.get('severity') or 'MEDIUM').upper()
 
             Vulnerability.objects.get_or_create(
                 target=scan.target,
                 title=title,
                 defaults={
-                    'severity': mapped_severity,
-                    'description': description,
-                    'remediation': remediation,
-                    'source_tool': 'Nuclei',
-                    'cve_id': cve_id,
-                    'cwe_id': cwe_id,
-                    'cvss_score': cvss_score,
-                    'references': references
+                    'severity': severity,
+                    'description': item.get('finding', ''),
+                    'remediation': 'Apply recommended security headers and configuration updates.',
+                    'source_tool': 'PythonScanner',
+                    'cve_id': item.get('cve', ''),
+                    'cwe_id': item.get('cwe', ''),
+                    'references': ''
                 }
             )
 
@@ -301,13 +227,15 @@ def run_nuclei_vuln_scan(self, scan_id):
         try:
             faraday_result = _import_nuclei_result_to_faraday(output_file)
             if faraday_result:
-                logger.info("Imported Nuclei scan %s results to Faraday: %s", scan_id, faraday_result)
+                logger.info("Imported Python scan %s results to Faraday: %s", scan_id, faraday_result)
         except Exception as exc:
-            logger.warning("Faraday import failed for Nuclei scan %s: %s", scan_id, exc)
+            logger.warning("Faraday import failed for Python scan %s: %s", scan_id, exc)
     except Exception as e:
         scan.status = 'FAILED'
         scan.result_file = str(e)
     finally:
+        scan.save()
+
         scan.completed_at = timezone.now()
         scan.save()
 
@@ -1093,118 +1021,48 @@ def monitor_endpoint_changes(self):
 @shared_task(bind=True)
 def run_wapiti(self, scan_id):
     """
-    Executes Wapiti web vulnerability scanner with depth-limited crawling
-    and domain-scoped scanning, then persists discovered vulnerabilities.
+    Executes Python web vulnerability scanner (replacing Wapiti)
+    and persists discovered vulnerabilities to DB.
     """
     scan = Scan.objects.get(id=scan_id)
     scan.status = 'RUNNING'
     scan.celery_task_id = self.request.id
     scan.save()
 
-    target_url = f"https://{scan.target.domain}"
+    target_domain = scan.target.domain
+    target_url = f"https://{target_domain}"
     output_file = settings.SCAN_OUTPUT_DIR / f'wapiti_{scan_id}.json'
 
-    # Wapiti CLI flags:
-    #   -u <url>          Target URL
-    #   --scope domain    Restrict scan to the same domain
-    #   --max-links-per-page <n>  Max links crawled per page
-    #   -d <depth>        Crawl depth
-    #   -f json           Output format
-    #   -o <file>         Output file path
-    command = [
-        settings.WAPITI_PATH,
-        '-u', target_url,
-        '--scope', 'domain',
-        '--max-links-per-page', '20',
-        '-d', '2',
-        '-f', 'json',
-        '-o', str(output_file),
-    ]
-
     try:
-        subprocess.run(command, capture_output=True, text=True, timeout=600)
+        from attacksurface.scanner.vulnerability_scanner import run_python_vuln_scanner
+        httpx_items = [{"url": target_url, "headers": {}, "status_code": 0}]
+        findings = run_python_vuln_scanner(target_domain, httpx_items)
 
-        if output_file.exists():
-            with open(output_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(findings, indent=2))
 
-            # Wapiti JSON output structure:
-            # {
-            #   "target": "https://example.com",
-            #   "scan_date": "...",
-            #   "vulnerabilities": {
-            #       "SQL Injection": [
-            #           {
-            #               "url": "...",
-            #               "parameter": "...",
-            #               "severity": "critical",
-            #               "description": "...",
-            #               "payload": "..."
-            #           }
-            #       ],
-            #       ...
-            #   }
-            # }
+        for item in findings:
+            title = item.get('finding') or item.get('vulnerability_id') or 'Vulnerability Discovered'
+            severity = str(item.get('severity') or 'MEDIUM').upper()
 
-            vulns = data.get('vulnerabilities', {})
-            if not vulns:
-                # Some wapiti versions nest under 'vulnerabilities'
-                vulns = data
+            Vulnerability.objects.get_or_create(
+                target=scan.target,
+                title=title[:255],
+                defaults={
+                    'severity': severity,
+                    'description': item.get('finding', ''),
+                    'remediation': 'Apply recommended security headers and configuration updates.',
+                    'source_tool': 'PythonScanner',
+                    'references': target_url,
+                }
+            )
 
-            severity_map = {
-                'critical': 'CRITICAL',
-                'high': 'HIGH',
-                'medium': 'MEDIUM',
-                'low': 'LOW',
-                'info': 'INFO',
-            }
-
-            for vuln_type, findings in vulns.items():
-                if isinstance(findings, list):
-                    for finding in findings:
-                        title = f"{vuln_type}: {finding.get('url', '')}"
-                        raw_severity = finding.get('severity', 'medium').lower()
-                        severity = severity_map.get(raw_severity, 'MEDIUM')
-                        description = finding.get('description', f'Wapiti detected {vuln_type}')
-                        parameter = finding.get('parameter', '')
-                        payload = finding.get('payload', '')
-                        evidence = finding.get('evidence', '')
-
-                        parts = [description]
-                        if parameter:
-                            parts.append(f"Parameter: {parameter}")
-                        if payload:
-                            parts.append(f"Payload: {payload}")
-                        if evidence:
-                            parts.append(f"Evidence: {evidence}")
-                        full_description = "\n".join(parts)
-
-                        Vulnerability.objects.get_or_create(
-                            target=scan.target,
-                            title=title[:255],
-                            defaults={
-                                'severity': severity,
-                                'description': full_description,
-                                'remediation': f'Review and fix the {vuln_type} vulnerability at {finding.get("url", "")}',
-                                'source_tool': 'Wapiti',
-                                'references': finding.get('url', ''),
-                            }
-                        )
-
-            scan.status = 'COMPLETED'
-            scan.result_file = str(output_file)
-        else:
-            scan.status = 'FAILED'
-            scan.result_file = 'Wapiti did not produce output file'
-    except subprocess.TimeoutExpired:
-        scan.status = 'FAILED'
-        scan.result_file = 'Wapiti scan timed out (600s)'
-    except FileNotFoundError:
-        scan.status = 'FAILED'
-        scan.result_file = f'Wapiti not found at "{settings.WAPITI_PATH}"'
+        scan.status = 'COMPLETED'
+        scan.result_file = str(output_file)
     except Exception as e:
         scan.status = 'FAILED'
         scan.result_file = str(e)
     finally:
         scan.completed_at = timezone.now()
         scan.save()
+

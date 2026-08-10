@@ -49,6 +49,8 @@ class EndpointResultSerializer(serializers.ModelSerializer):
             "technologies",
             "threat_count",
             "method",
+            "auth_required",
+            "source_tool",
             "discovered_at",
             "last_scan",
         ]
@@ -78,6 +80,13 @@ class DirectoryResultSerializer(serializers.ModelSerializer):
             "content_type",
             "content_details",
             "status",
+            # Content-based classification (computed by the analysis engine)
+            "category",
+            "risk",
+            "access_status",
+            "is_sensitive",
+            "sensitive_matches",
+            "title",
             "directories_created",
             "discovered_date",
             "created",
@@ -149,15 +158,9 @@ class EmailSecurityResultSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "domain",
-            "root_txt",
             "spf",
             "dmarc",
             "mx",
-            "dkim_selector1",
-            "dkim_default",
-            "smtp_hosts",
-            "smtp_port_scan",
-            "smtp_open_relay",
             "smtp_starttls",
             "created_at",
         ]

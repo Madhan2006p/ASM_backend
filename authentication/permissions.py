@@ -174,18 +174,42 @@ def get_user_org_id_from_data(request):
     return get_user_org_id(request)
 
 
-# Feature number to module mapping (for feature-based access control)
+# Feature mapping from module keys to feature IDs (High-level feature access control)
+FEATURE_MAP = {
+    # Asset Discovery (Feature ID: "1")
+    "subdomains": "1",
+    "endpoints": "1",
+    "open_ports": "1",
+    "directories": "1",
+    "technologies": "1",
+    "vulnerabilities": "1",
+    "ssl_certificates": "1",
+    "asset_discovery": "1",
+
+    # Mobile Security (Feature ID: "2")
+    "apk_scanner": "2",
+    "mobile_security": "2",
+
+    # Email Security (Feature ID: "3")
+    "email_security": "3",
+
+    # Internal Asset Discovery (Feature ID: "4")
+    "internal_asset": "4",
+
+    # Surface Web (Feature ID: "5")
+    "surface_web": "5",
+
+    # Brand Monitoring (Feature ID: "6")
+    "brand_monitoring": "6",
+}
+
 FEATURE_MODULE_MAP = {
-    "1": "subdomains",
-    "2": "endpoints",
-    "3": "open_ports",
-    "4": "directories",
-    "5": "technologies",
-    "6": "vulnerabilities",
-    "7": "ssl_certificates",
-    "8": "email_security",
-    "9": "scan_history",
-    "10": "surface_web",
+    "1": "asset_discovery",
+    "2": "apk_scanner",
+    "3": "email_security",
+    "4": "internal_asset",
+    "5": "surface_web",
+    "6": "brand_monitoring",
 }
 
 
@@ -216,12 +240,8 @@ def user_has_feature(user, module_name):
     feature_ids = [f.strip() for f in profile.features.split(",") if f.strip()]
     if not feature_ids:
         return True
-    # Find which feature number corresponds to this module
-    feature_id = None
-    for fid, mod in FEATURE_MODULE_MAP.items():
-        if mod == module_name:
-            feature_id = fid
-            break
+    # Find the feature ID that this module belongs to
+    feature_id = FEATURE_MAP.get(module_name)
     if feature_id is None:
         # No feature lock for this module
         return True

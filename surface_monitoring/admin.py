@@ -1,34 +1,14 @@
 from django.contrib import admin
+from .models import SpiderfootScan, SpiderfootResult
 
-from .models import GitHubRepository, RepoScan, SurfaceMonitorConfig
+@admin.register(SpiderfootScan)
+class SpiderfootScanAdmin(admin.ModelAdmin):
+    list_display = ('target', 'status', 'org_id', 'created_at', 'completed_at')
+    list_filter = ('status', 'org_id')
+    search_fields = ('target',)
 
-
-@admin.register(SurfaceMonitorConfig)
-class SurfaceMonitorConfigAdmin(admin.ModelAdmin):
-    list_display = ('keyword', 'is_active', 'interval_minutes', 'created_at')
-    list_filter = ('is_active',)
-    search_fields = ('keyword',)
-
-
-@admin.register(GitHubRepository)
-class GitHubRepositoryAdmin(admin.ModelAdmin):
-    list_display = (
-        'full_name', 'owner', 'visibility', 'language', 'stars',
-        'hardcoded_credentials_count', 'scanned_files_count', 'status',
-    )
-    list_filter = ('visibility', 'language', 'status')
-    search_fields = ('full_name', 'owner', 'name', 'description')
-    readonly_fields = (
-        'hardcoded_credentials_count', 'scanned_files_count',
-        'last_scanned_at', 'discovered_at',
-    )
-
-
-@admin.register(RepoScan)
-class RepoScanAdmin(admin.ModelAdmin):
-    list_display = (
-        'repository', 'status', 'hardcoded_credentials_count',
-        'scanned_files_count', 'started_at', 'completed_at',
-    )
-    list_filter = ('status',)
-    search_fields = ('repository__full_name',)
+@admin.register(SpiderfootResult)
+class SpiderfootResultAdmin(admin.ModelAdmin):
+    list_display = ('scan', 'data_type', 'data_value', 'module', 'source', 'created_at')
+    list_filter = ('data_type', 'module')
+    search_fields = ('data_value', 'source')
