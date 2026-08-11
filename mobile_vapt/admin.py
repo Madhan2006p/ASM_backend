@@ -21,8 +21,12 @@ class MobileScanAdmin(admin.ModelAdmin):
         if not obj.file_name and obj.apk_file:
             obj.file_name = os.path.basename(obj.apk_file.name)
         if not obj.scan_hash and obj.apk_file:
+            # Salt the filename-based hash with a UUID so re-uploading an APK
+            # with the same filename doesn't violate the scan_hash UNIQUE
+            # constraint (the real MobSF hash replaces this after upload).
             import hashlib
-            obj.scan_hash = hashlib.md5(obj.apk_file.name.encode()).hexdigest()
+            import uuid
+            obj.scan_hash = hashlib.md5((obj.apk_file.name + uuid.uuid4().hex).encode()).hexdigest()
         # Ensure file_path + source are populated so the MobSF scan thread can find the binary
         if obj.apk_file and not obj.file_path:
             obj.file_path = obj.apk_file.path
